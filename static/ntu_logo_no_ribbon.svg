@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 390" role="img" aria-label="National Textile University crest">
+  <path d="M79 48 Q210 72 341 48 L350 181 Q347 290 210 366 Q73 290 70 181 Z"
+        fill="none" stroke="#c41e3a" stroke-width="15" stroke-linejoin="round"/>
+
+  <path d="M119 145 L187 77 L216 106 L148 174 Z" fill="#0a7fb8"/>
+  <path d="M187 77 L282 172 L253 201 L158 106 Z" fill="#0a7fb8"/>
+  <path d="M301 174 L235 240 L206 211 L272 145 Z" fill="#0a7fb8"/>
+  <path d="M235 240 L141 146 L170 117 L264 211 Z" fill="#0a7fb8"/>
+
+  <path d="M120 93 L161 134 L143 152 L102 111 Z" fill="#c41e3a"/>
+  <path d="M281 229 L239 187 L257 169 L299 211 Z" fill="#c41e3a"/>
+  <path d="M174 210 L220 164 L239 183 L193 229 Z" fill="#8ec8ef"/>
+  <path d="M273 84 L300 111 L283 128 L256 101 Z" fill="#8ec8ef"/>
+  <path d="M111 239 L139 211 L157 229 L129 257 Z" fill="#8ec8ef"/>
+
+  <text x="210" y="324" text-anchor="middle"
+        font-family="Arial, Helvetica, sans-serif" font-weight="800"
+        font-size="49" fill="#ffffff" stroke="#173a6b" stroke-width="7"
+        paint-order="stroke">NTU</text>
+
+</svg>

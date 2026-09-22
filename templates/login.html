@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NTU Research Agent | Secure Login</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=44">
+  <script>
+    (function(){var t=localStorage.getItem('ntu-theme')||'light';document.documentElement.setAttribute('data-theme',t);})();
+  </script>
+</head>
+<body>
+<div class="login-page">
+  <button class="theme-toggle login-theme-toggle" type="button" data-theme-toggle aria-label="Switch color theme">
+    <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 14.5A8.5 8.5 0 1 1 9.5 3 7 7 0 0 0 21 14.5Z"/></svg>
+    <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M3 12h2M19 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>
+  </button>
+  <section class="login-showcase">
+    <div class="showcase-head">
+      <div class="login-brand-stack">
+        <div class="ntu-lockup">
+          <div class="ntu-logo-mark">
+            <img class="ntu-logo-img" src="{{ url_for('static', filename='ntu_logo_no_ribbon.svg') }}?v=11" alt="National Textile University logo">
+            <span>Innovate and Lead</span>
+          </div>
+          <div class="brand-copy">
+            <strong>National Textile University</strong>
+            <span>Software Engineering Research</span>
+          </div>
+        </div>
+        <img class="login-oracle-wordmark" src="{{ url_for('static', filename='oracle_wordmark_official.png') }}?v=1" alt="Oracle">
+      </div>
+    </div>
+
+    <div class="data-orbit" aria-hidden="true">
+      <div class="orbit-ring orbit-ring-one"></div>
+      <div class="orbit-ring orbit-ring-two"></div>
+      <div class="orbit-core">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <ellipse cx="12" cy="5" rx="7" ry="3"/>
+          <path d="M5 5v7c0 1.7 3.1 3 7 3s7-1.3 7-3V5"/>
+          <path d="M5 12v7c0 1.7 3.1 3 7 3s7-1.3 7-3v-7"/>
+        </svg>
+      </div>
+      <span class="orbit-tag tag-sql">SELECT</span>
+      <span class="orbit-tag tag-python">PYTHON</span>
+      <span class="orbit-tag tag-oracle">ORACLE 26ai</span>
+    </div>
+
+    <div class="showcase-main">
+      <div class="showcase-kicker"><i></i> AI Database Workspace</div>
+      <h1><span>Urdu language to Oracle SQL,</span><br><span>with Python in control.</span></h1>
+      <p>
+        Ask clear questions, discover useful patterns and review the information
+        you need through one focused research experience.
+      </p>
+    </div>
+
+    <div class="architecture">
+      <div class="arch-node"><small>Step 01</small><strong>User Query</strong></div>
+      <div class="arch-node"><small>Step 02</small><strong>AI Generates SQL</strong></div>
+      <div class="arch-node"><small>Step 03</small><strong>Python Validates</strong></div>
+      <div class="arch-node"><small>Step 04</small><strong>Oracle Executes</strong></div>
+    </div>
+  </section>
+
+  <section class="login-panel">
+    <div class="login-card">
+      <div class="panel-top">
+        <div class="panel-mini-ntu ntu-lockup">
+          <div class="ntu-logo-mark">
+            <img class="ntu-logo-img" src="{{ url_for('static', filename='ntu_logo_no_ribbon.svg') }}?v=11" alt="National Textile University logo">
+            <span>Innovate and Lead</span>
+          </div>
+          <div class="brand-copy"><strong>NTU Research</strong><span>Employee Data Assistant</span></div>
+        </div>
+      </div>
+
+      <div class="eyebrow">Secure Database Authentication</div>
+      <h2>Sign in to Research Agent</h2>
+      <p class="lead">Sign in with your authorized Oracle account.</p>
+
+      {% if error %}<div class="alert">{{ error }}</div>{% endif %}
+
+      <form method="POST" action="{{ url_for('login') }}" autocomplete="off">
+        <div class="field">
+          <label for="username">Oracle Username</label>
+          <div class="input-wrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 21a8 8 0 0 0-16 0"/><circle cx="12" cy="7" r="4"/></svg>
+            <input id="username" name="username" type="text" placeholder="Enter username" required autofocus>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="password">Password</label>
+          <div class="input-wrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+            <input id="password" name="password" type="password" placeholder="Enter password" required>
+            <button class="toggle-pass" type="button" onclick="togglePassword()" aria-label="Show password">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <button class="primary-btn" type="submit"><span>Continue to Research Assistant</span></button>
+      </form>
+
+      <div class="security-note">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 22s8-3.5 8-10V5l-8-3-8 3v7c0 6.5 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>
+        <span>Ask about employee data in everyday language and the system will safely prepare, validate and run the required Oracle query before presenting a clear answer.</span>
+      </div>
+    </div>
+  </section>
+</div>
+<script>
+function togglePassword(){
+  const p=document.getElementById('password');
+  p.type=p.type==='password'?'text':'password';
+}
+</script>
+<script src="{{ url_for('static', filename='theme.js') }}?v=8"></script>
+</body>
+</html>

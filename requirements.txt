@@ -1,0 +1,4 @@
+Flask>=3.0
+python-dotenv>=1.0
+oracledb>=2.5
+openai>=1.0
