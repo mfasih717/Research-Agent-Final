@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NTU Research Agent | Secure Login</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=44">
+  <link rel="stylesheet" href="/static/style.css?v=46">
   <script>
     (function(){var t=localStorage.getItem('ntu-theme')||'light';document.documentElement.setAttribute('data-theme',t);})();
   </script>
@@ -20,7 +20,7 @@
       <div class="login-brand-stack">
         <div class="ntu-lockup">
           <div class="ntu-logo-mark">
-            <img class="ntu-logo-img" src="{{ url_for('static', filename='ntu_logo_no_ribbon.svg') }}?v=11" alt="National Textile University logo">
+            <img class="ntu-logo-img" src="/static/ntu_logo_no_ribbon.svg?v=11" alt="National Textile University logo">
             <span>Innovate and Lead</span>
           </div>
           <div class="brand-copy">
@@ -28,7 +28,7 @@
             <span>Software Engineering Research</span>
           </div>
         </div>
-        <img class="login-oracle-wordmark" src="{{ url_for('static', filename='oracle_wordmark_official.png') }}?v=1" alt="Oracle">
+        <img class="login-oracle-wordmark" src="/static/oracle_wordmark_official.png?v=1" alt="Oracle">
       </div>
     </div>
 
@@ -69,7 +69,7 @@
       <div class="panel-top">
         <div class="panel-mini-ntu ntu-lockup">
           <div class="ntu-logo-mark">
-            <img class="ntu-logo-img" src="{{ url_for('static', filename='ntu_logo_no_ribbon.svg') }}?v=11" alt="National Textile University logo">
+            <img class="ntu-logo-img" src="/static/ntu_logo_no_ribbon.svg?v=11" alt="National Textile University logo">
             <span>Innovate and Lead</span>
           </div>
           <div class="brand-copy"><strong>NTU Research</strong><span>Employee Data Assistant</span></div>
@@ -82,7 +82,7 @@
 
       {% if error %}<div class="alert">{{ error }}</div>{% endif %}
 
-      <form method="POST" action="{{ url_for('login') }}" autocomplete="off">
+      <form method="POST" action="/login" autocomplete="off">
         <div class="field">
           <label for="username">Oracle Username</label>
           <div class="input-wrap">
@@ -118,6 +118,6 @@ function togglePassword(){
   p.type=p.type==='password'?'text':'password';
 }
 </script>
-<script src="{{ url_for('static', filename='theme.js') }}?v=8"></script>
+<script src="/static/theme.js?v=8"></script>
 </body>
 </html>

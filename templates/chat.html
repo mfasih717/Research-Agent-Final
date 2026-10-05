@@ -4,200 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NTU Research Agent | Oracle Assistant</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=44">
+  <link rel="stylesheet" href="/static/style.css?v=52">
   <script>
     (function(){var t=localStorage.getItem('ntu-theme')||'light';document.documentElement.setAttribute('data-theme',t);})();
   </script>
-  <style>
-    /* =========================================================
-       EXCLUSIVE LIGHT MODE DYNAMIC CHAT BACKGROUND ANIMATION
-       ========================================================= */
-    [data-theme="light"] .chat-ambient-dark {
-      display: none !important;
-    }
-
-    [data-theme="light"] .chat-light-bars {
-      position: absolute;
-      inset: 0;
-      overflow: hidden;
-      pointer-events: none;
-      z-index: 0;
-      background: radial-gradient(circle at 50% 30%, rgba(240, 244, 255, 0.75) 0%, rgba(246, 248, 252, 0.95) 100%);
-    }
-
-    /* Ambient Aurora Glowing Fluid Blobs */
-    [data-theme="light"] .chat-light-bars::before,
-    [data-theme="light"] .chat-light-bars::after {
-      content: "";
-      position: absolute;
-      border-radius: 42% 58% 70% 30% / 45% 45% 55% 55%;
-      filter: blur(65px);
-      opacity: 0.55;
-      animation: fluidDrift 18s ease-in-out infinite alternate;
-    }
-
-    [data-theme="light"] .chat-light-bars::before {
-      width: 480px;
-      height: 480px;
-      top: -60px;
-      left: 15%;
-      background: linear-gradient(135deg, rgba(99, 102, 241, 0.28), rgba(56, 189, 248, 0.22), rgba(168, 85, 247, 0.15));
-    }
-
-    [data-theme="light"] .chat-light-bars::after {
-      width: 520px;
-      height: 520px;
-      bottom: -80px;
-      right: 12%;
-      background: linear-gradient(135deg, rgba(14, 165, 233, 0.22), rgba(129, 140, 248, 0.25), rgba(244, 114, 182, 0.16));
-      animation-duration: 22s;
-      animation-delay: -9s;
-    }
-
-    /* Modern Floating Luminous Energy Pillars */
-    [data-theme="light"] .chat-light-bars i {
-      position: absolute;
-      bottom: -50px;
-      border-radius: 999px;
-      pointer-events: none;
-      opacity: 0;
-      animation: beamPulse 6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
-    }
-
-    /* Diverse wave bars with glowing capsules */
-    [data-theme="light"] .chat-light-bars i:nth-child(1) {
-      left: 6%;
-      width: 3px;
-      height: 52%;
-      background: linear-gradient(180deg, rgba(99, 102, 241, 0) 0%, rgba(99, 102, 241, 0.45) 50%, rgba(56, 189, 248, 0.65) 100%);
-      box-shadow: 0 0 16px rgba(56, 189, 248, 0.4);
-      animation-duration: 5.5s;
-      animation-delay: 0.2s;
-    }
-
-    [data-theme="light"] .chat-light-bars i:nth-child(2) {
-      left: 17%;
-      width: 4px;
-      height: 68%;
-      background: linear-gradient(180deg, rgba(14, 165, 233, 0) 0%, rgba(14, 165, 233, 0.4) 45%, rgba(99, 102, 241, 0.6) 100%);
-      box-shadow: 0 0 20px rgba(99, 102, 241, 0.35);
-      animation-duration: 7.2s;
-      animation-delay: 1.6s;
-    }
-
-    [data-theme="light"] .chat-light-bars i:nth-child(3) {
-      left: 28%;
-      width: 2px;
-      height: 44%;
-      background: linear-gradient(180deg, rgba(168, 85, 247, 0) 0%, rgba(168, 85, 247, 0.35) 50%, rgba(129, 140, 248, 0.55) 100%);
-      box-shadow: 0 0 14px rgba(168, 85, 247, 0.3);
-      animation-duration: 6.0s;
-      animation-delay: 2.8s;
-    }
-
-    [data-theme="light"] .chat-light-bars i:nth-child(4) {
-      left: 41%;
-      width: 5px;
-      height: 75%;
-      background: linear-gradient(180deg, rgba(56, 189, 248, 0) 0%, rgba(56, 189, 248, 0.45) 40%, rgba(99, 102, 241, 0.7) 100%);
-      box-shadow: 0 0 24px rgba(56, 189, 248, 0.45);
-      animation-duration: 8.5s;
-      animation-delay: 0.8s;
-    }
-
-    [data-theme="light"] .chat-light-bars i:nth-child(5) {
-      left: 53%;
-      width: 3px;
-      height: 48%;
-      background: linear-gradient(180deg, rgba(99, 102, 241, 0) 0%, rgba(99, 102, 241, 0.35) 50%, rgba(14, 165, 233, 0.6) 100%);
-      box-shadow: 0 0 16px rgba(99, 102, 241, 0.3);
-      animation-duration: 5.8s;
-      animation-delay: 2.1s;
-    }
-
-    [data-theme="light"] .chat-light-bars i:nth-child(6) {
-      left: 65%;
-      width: 4px;
-      height: 64%;
-      background: linear-gradient(180deg, rgba(168, 85, 247, 0) 0%, rgba(14, 165, 233, 0.4) 40%, rgba(99, 102, 241, 0.65) 100%);
-      box-shadow: 0 0 20px rgba(168, 85, 247, 0.35);
-      animation-duration: 7.8s;
-      animation-delay: 3.4s;
-    }
-
-    [data-theme="light"] .chat-light-bars i:nth-child(7) {
-      left: 76%;
-      width: 2px;
-      height: 58%;
-      background: linear-gradient(180deg, rgba(14, 165, 233, 0) 0%, rgba(14, 165, 233, 0.4) 50%, rgba(56, 189, 248, 0.6) 100%);
-      box-shadow: 0 0 15px rgba(14, 165, 233, 0.35);
-      animation-duration: 6.4s;
-      animation-delay: 1.1s;
-    }
-
-    [data-theme="light"] .chat-light-bars i:nth-child(8) {
-      left: 87%;
-      width: 4px;
-      height: 50%;
-      background: linear-gradient(180deg, rgba(99, 102, 241, 0) 0%, rgba(99, 102, 241, 0.4) 50%, rgba(168, 85, 247, 0.6) 100%);
-      box-shadow: 0 0 18px rgba(99, 102, 241, 0.3);
-      animation-duration: 6.9s;
-      animation-delay: 0.5s;
-    }
-
-    [data-theme="light"] .chat-light-bars i:nth-child(9) {
-      left: 95%;
-      width: 3px;
-      height: 62%;
-      background: linear-gradient(180deg, rgba(56, 189, 248, 0) 0%, rgba(56, 189, 248, 0.4) 45%, rgba(99, 102, 241, 0.6) 100%);
-      box-shadow: 0 0 16px rgba(56, 189, 248, 0.35);
-      animation-duration: 7.5s;
-      animation-delay: 2.6s;
-    }
-
-    @keyframes beamPulse {
-      0% {
-        transform: translateY(30px) scaleY(0.7);
-        opacity: 0;
-      }
-      25% {
-        opacity: 0.85;
-      }
-      50% {
-        transform: translateY(-50px) scaleY(1.18);
-        opacity: 0.95;
-      }
-      80% {
-        opacity: 0.4;
-      }
-      100% {
-        transform: translateY(-110px) scaleY(1.3);
-        opacity: 0;
-      }
-    }
-
-    @keyframes fluidDrift {
-      0% {
-        transform: translate(0, 0) rotate(0deg) scale(1);
-        border-radius: 42% 58% 70% 30% / 45% 45% 55% 55%;
-      }
-      50% {
-        transform: translate(45px, 25px) rotate(120deg) scale(1.12);
-        border-radius: 58% 42% 40% 60% / 55% 65% 35% 45%;
-      }
-      100% {
-        transform: translate(-35px, -35px) rotate(240deg) scale(0.92);
-        border-radius: 35% 65% 55% 45% / 60% 40% 60% 40%;
-      }
-    }
-  </style>
 </head>
 <body class="chat-page">
 <div class="app-shell">
   <aside class="sidebar" id="sidebar">
     <div class="side-brand">
       <div class="ntu-logo-mark">
-        <img class="ntu-logo-img" src="{{ url_for('static', filename='ntu_logo_no_ribbon.svg') }}?v=11" alt="National Textile University logo">
+        <img class="ntu-logo-img" src="/static/ntu_logo_no_ribbon.svg?v=11" alt="National Textile University logo">
         <span>Innovate and Lead</span>
       </div>
       <div class="brand-copy">
@@ -206,7 +23,7 @@
       </div>
     </div>
 
-    <div class="side-oracle"><img class="oracle-wordmark-img" src="{{ url_for('static', filename='oracle_wordmark_official.png') }}?v=1" alt="Oracle"></div>
+    <div class="side-oracle"><img class="oracle-wordmark-img" src="/static/oracle_wordmark_official.png?v=1" alt="Oracle"></div>
 
     <div class="side-label">Research Workspace</div>
     <div class="side-item active">
@@ -225,7 +42,7 @@
     </div>
     <div class="side-item">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>
-      Designations & Salary
+      Designations &amp; Salary
     </div>
 
     <div class="side-label">Session Privacy</div>
@@ -235,7 +52,7 @@
 
     <div class="side-footer">
       <div class="user-card"><small>Oracle User</small><strong>{{ db_username or 'RESEARCH' }}</strong></div>
-      <a class="logout" href="{{ url_for('logout') }}">
+      <a class="logout" href="/logout">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M10 17l5-5-5-5"/><path d="M15 12H3"/><path d="M21 3v18"/></svg>
         Disconnect Session
       </a>
@@ -275,6 +92,7 @@
         </div>
 
         <div class="chat-ambient chat-ambient-dark" aria-hidden="true"><span></span><span></span><i></i><i></i><i></i></div>
+
 
         <div id="messages">
           {% for item in history %}
@@ -393,7 +211,8 @@ let nextMessageFromVoice=false;
 function showRecordingStatus(){
   recordingStartedAt=Date.now();input.hidden=true;recordingStatus.classList.add('active');
   recordingTime.textContent='0:00';recordingTranscript.textContent='Listening...';
-  recordingTimer=setInterval(()=>{const seconds=Math.floor((Date.now()-recordingStartedAt)/1000);recordingTime.textContent=`${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,'0')}`;},250);
+  recordUserActivity();
+  recordingTimer=setInterval(()=>{recordUserActivity();const seconds=Math.floor((Date.now()-recordingStartedAt)/1000);recordingTime.textContent=`${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,'0')}`;},250);
 }
 function hideRecordingStatus(){clearInterval(recordingTimer);recordingTimer=null;recordingStatus.classList.remove('active');input.hidden=false;}
 
@@ -506,6 +325,8 @@ async function submitVoiceRecording(){
   voiceBtn.setAttribute('aria-label','Start voice input');
   if(microphoneStream)microphoneStream.getTracks().forEach(track=>track.stop());
   if(discardRecording){voiceBtn.disabled=false;audioChunks=[];return;}
+  isRequestInFlight=true;
+  recordUserActivity();
   try{
     composerNote.textContent='Detecting language and transcribing...';
     const blob=new Blob(audioChunks,{type:mediaRecorder.mimeType||'audio/webm'});
@@ -513,7 +334,7 @@ async function submitVoiceRecording(){
     payload.append('audio',blob,'voice.webm');
     const response=await fetch('/api/transcribe',{method:'POST',body:payload});
     const data=await response.json();
-    if(response.status===401){window.location.href='/login';return;}
+    if(response.status===401){window.location.href='/login?reason=expired';return;}
     if(!response.ok)throw new Error(data.error||'Voice transcription failed.');
     input.value=(data.transcript||'').trim();
     if(!input.value)throw new Error('No speech was detected. Please try again.');
@@ -523,13 +344,16 @@ async function submitVoiceRecording(){
   }catch(error){
     composerNote.textContent=error.message||'Voice was not clear. Please try again.';
   }finally{
+    isRequestInFlight=false;
     voiceBtn.disabled=false;
     audioChunks=[];
+    recordUserActivity();
   }
 }
 
 form.addEventListener('submit',async(e)=>{
   e.preventDefault();
+  recordUserActivity();
   if(voiceSessionActive){stopBrowserVoice();return;}
   if(mediaRecorder&&mediaRecorder.state==='recording'){mediaRecorder.stop();return;}
   const message=input.value.trim();if(!message)return;
@@ -537,50 +361,158 @@ form.addEventListener('submit',async(e)=>{
   const preferredLanguage=nextMessageFromVoice?languageSelect.value:null;nextMessageFromVoice=false;
   welcome.style.display='none';chatAmbients.forEach(item=>item.style.display='none');addMessage('user',message);input.value='';sendBtn.disabled=true;
   const typing=addMessage('bot','',true);
+  isRequestInFlight=true;
   try{
     const response=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,language:preferredLanguage,source:messageSource})});
     const data=await response.json();typing.remove();
-    if(response.status===401){window.location.href='/login';return;}
+    if(response.status===401){window.location.href='/login?reason=expired';return;}
     addMessage('bot',data.reply||data.error||'No response received.');
+    recordUserActivity();
   }catch(err){
     typing.remove();addMessage('bot','Unable to reach the application. Please try again.');
   }finally{
+    isRequestInFlight=false;
     sendBtn.disabled=false;input.focus();
     composerNote.textContent='Tap the microphone and speak in Urdu or English.';
+    recordUserActivity();
   }
 });
 
 /* ---------------------------------------------------------
-   INACTIVITY SESSION TIMEOUT
-   60 seconds without mouse, keyboard, click, touch or scroll
-   = disconnect the session and return to login.
+   ACTIVITY TRACKING & INACTIVITY SESSION TIMEOUT
+   Tracks ALL genuine user interactions:
+   - Mouse movement (mousemove, pointermove)
+   - Clicks and touches (mousedown, mouseup, click, touchstart, touchmove)
+   - Keyboard & typing (keydown, keyup, keypress, input, change)
+   - Scrolling & wheeling (scroll, wheel)
+   - Voice dictation / recording and in-flight AI queries
+   Continuously keeps server session alive via /api/heartbeat.
+   Only disconnects after 60s of complete absence of activity.
    --------------------------------------------------------- */
-const INACTIVITY_LIMIT = 60 * 1000;
+const INACTIVITY_LIMIT = ({{ session_timeout_seconds or 60 }}) * 1000;
+let lastActivityTime = Date.now();
+let lastServerHeartbeatTime = 0;
 let inactivityTimer = null;
+let isDisconnecting = false;
+let heartbeatInProgress = false;
+let isRequestInFlight = false;
 
 function disconnectForInactivity() {
-  window.location.href = "{{ url_for('logout') }}?reason=inactive";
-}
-
-function resetInactivityTimer() {
+  if (isDisconnecting) return;
+  isDisconnecting = true;
   clearTimeout(inactivityTimer);
-  inactivityTimer = setTimeout(disconnectForInactivity, INACTIVITY_LIMIT);
+  window.location.href = "/logout?reason=inactive";
 }
 
-["mousemove", "mousedown", "keydown", "touchstart", "pointerdown"].forEach(eventName => {
-  document.addEventListener(eventName, resetInactivityTimer, {passive:true});
+async function sendServerHeartbeat() {
+  if (isDisconnecting || heartbeatInProgress) return;
+  heartbeatInProgress = true;
+  lastServerHeartbeatTime = Date.now();
+  try {
+    const res = await fetch('/api/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin'
+    });
+    if (res.status === 401) {
+      disconnectForInactivity();
+    }
+  } catch (err) {
+    // Network hiccup; will retry automatically
+  } finally {
+    heartbeatInProgress = false;
+  }
+}
+
+function recordUserActivity() {
+  if (isDisconnecting) return;
+  lastActivityTime = Date.now();
+
+  // If >= 15 seconds passed since last server heartbeat, sync with server now
+  if (Date.now() - lastServerHeartbeatTime >= 15000) {
+    sendServerHeartbeat();
+  }
+}
+
+function checkInactivity() {
+  if (isDisconnecting) return;
+  if (isRequestInFlight || voiceSessionActive || (mediaRecorder && mediaRecorder.state === 'recording')) {
+    lastActivityTime = Date.now();
+  }
+  const elapsed = Date.now() - lastActivityTime;
+  if (elapsed >= INACTIVITY_LIMIT) {
+    disconnectForInactivity();
+  } else {
+    clearTimeout(inactivityTimer);
+    inactivityTimer = setTimeout(checkInactivity, Math.min(INACTIVITY_LIMIT - elapsed, 2000));
+  }
+}
+
+// Track ALL genuine user interactions
+const activityEvents = [
+  "mousemove",
+  "pointermove",
+  "mousedown",
+  "mouseup",
+  "click",
+  "dblclick",
+  "contextmenu",
+  "keydown",
+  "keyup",
+  "keypress",
+  "input",
+  "change",
+  "focus",
+  "touchstart",
+  "touchmove",
+  "touchend",
+  "wheel"
+];
+
+activityEvents.forEach(eventName => {
+  window.addEventListener(eventName, recordUserActivity, { passive: true });
 });
 
-chatScroll.addEventListener("scroll", resetInactivityTimer, {passive:true});
-window.addEventListener("scroll", resetInactivityTimer, {passive:true});
+chatScroll.addEventListener("scroll", recordUserActivity, { passive: true });
+window.addEventListener("scroll", recordUserActivity, { passive: true });
 
-resetInactivityTimer();
+// Periodic server heartbeat sync every 5 seconds if user has been active
+setInterval(() => {
+  if (isDisconnecting) return;
+  const now = Date.now();
+  const timeSinceActivity = now - lastActivityTime;
+  const isActive = timeSinceActivity < (INACTIVITY_LIMIT - 5000) || isRequestInFlight || voiceSessionActive || (mediaRecorder && mediaRecorder.state === 'recording');
+  if (isActive && (now - lastServerHeartbeatTime >= 15000)) {
+    sendServerHeartbeat();
+  }
+}, 5000);
+
+// Periodic inactivity check
+setInterval(() => {
+  checkInactivity();
+}, 2000);
+
+// Tab visibility changes
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    if (Date.now() - lastActivityTime >= INACTIVITY_LIMIT) {
+      disconnectForInactivity();
+    } else {
+      recordUserActivity();
+      sendServerHeartbeat();
+    }
+  }
+});
+
+recordUserActivity();
+sendServerHeartbeat();
+checkInactivity();
 
 window.addEventListener('load',()=>requestAnimationFrame(()=>input.focus({preventScroll:true})));
 input.focus({preventScroll:true});
 const hasConversation={{ 'true' if history|length > 1 else 'false' }};
 chatScroll.scrollTop=hasConversation?chatScroll.scrollHeight:0;
 </script>
-<script src="{{ url_for('static', filename='theme.js') }}?v=8"></script>
+<script src="/static/theme.js?v=8"></script>
 </body>
 </html>

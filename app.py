@@ -11,7 +11,17 @@ Local research schema:
 - DESIGNATIONS
 """
 
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from fastapi import FastAPI, Request, Form, UploadFile, File
+from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
+
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import oracledb
 import os
 import re
@@ -26,9 +36,23 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
 
-app = Flask(__name__)
-app.config["TEMPLATES_AUTO_RELOAD"] = True
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change_this_secret_key_later")
+app = FastAPI()
+
+# Session middleware (signed cookie-based sessions)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.environ.get("FLASK_SECRET_KEY", "change_this_secret_key_later"),
+    session_cookie="session",
+    max_age=None,            # Session cookie (expires when browser closes)
+    same_site="lax",
+    https_only=False,
+)
+
+# Mount static files
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+# Set up Jinja2 templates
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 # ---- Local Oracle 26ai Free Database ----
 # Thin mode use ho raha hai, is liye old Oracle client / Toad setup touch nahi hota.
@@ -40,18 +64,228 @@ DB_SERVICE = "FREEPDB1"
 # Successful Oracle login ke baad credentials sirf running Python process ki memory mein rehte hain.
 ACTIVE_DB_LOGINS = {}
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+# ---------------------------------------------------------------------------
+# Thread-local/context storage for passing session data into business logic
+# functions (e.g. get_connection, _reference_names, run_query).
+# ---------------------------------------------------------------------------
+import contextvars
+_current_session_ref = contextvars.ContextVar("_current_session_ref", default=None)
+
+
+def _get_connection_internal(session_data):
+    """
+    Current logged-in Oracle user ke credentials se connection banata hai.
+    AI ko credentials nahi milte; connection hamesha Python banata hai.
+    """
+    if session_data is None:
+        raise RuntimeError("Database login session available nahi hai. Please dobara login karein.")
+
+    login_token = session_data.get("db_login_token")
+    credentials = ACTIVE_DB_LOGINS.get(login_token)
+
+    if not credentials:
+        raise RuntimeError("Database login session available nahi hai. Please dobara login karein.")
+
+    dsn = oracledb.makedsn(DB_HOST, DB_PORT, service_name=DB_SERVICE)
+
+    return oracledb.connect(
+        user=credentials["username"],
+        password=credentials["password"],
+        dsn=dsn
+    )
+
+
+def get_connection():
+    """
+    Current logged-in Oracle user ke credentials se connection banata hai.
+    AI ko credentials nahi milte; connection hamesha Python banata hai.
+    """
+    session_data = _current_session_ref.get()
+    return _get_connection_internal(session_data)
+
+
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 
-groq_client = (
-    OpenAI(
-        api_key=GROQ_API_KEY,
-        base_url="https://api.groq.com/openai/v1"
-    )
-    if GROQ_API_KEY
-    else None
-)
+# ---------------------------------------------------------------------------
+# Server-Side Session & Exact 60-Second Inactivity Enforcement
+# ---------------------------------------------------------------------------
+SESSION_INACTIVITY_TIMEOUT = int(os.environ.get("SESSION_INACTIVITY_TIMEOUT", "60"))  # 60 seconds (1 minute)
+
+
+def _clear_session_data(request: Request):
+    """Completely purges session credentials, in-memory tokens, and session state."""
+    login_token = request.session.get("db_login_token")
+    if login_token:
+        credentials = ACTIVE_DB_LOGINS.pop(login_token, None)
+        if credentials is not None:
+            credentials["password"] = None
+            credentials.clear()
+    request.session.clear()
+
+
+def _check_session_auth(request: Request, is_api: bool = False):
+    """
+    Enforces server-side session authentication and exact 60-second inactivity timeout.
+    - If valid and active (< 60s inactivity): updates last_activity to now and returns None.
+    - If expired (>= 60s inactivity) or unauthenticated: purges session and returns
+      a 401 JSONResponse (for API) or a 302 RedirectResponse to /login?reason=expired (for HTML).
+    """
+    import time
+    logged_in = request.session.get("logged_in")
+    login_token = request.session.get("db_login_token")
+    last_activity = request.session.get("last_activity")
+    now = time.time()
+
+    if not logged_in or not login_token or login_token not in ACTIVE_DB_LOGINS:
+        _clear_session_data(request)
+        if is_api:
+            return JSONResponse({"success": False, "error": "not_logged_in"}, status_code=401)
+        return RedirectResponse(url="/login", status_code=302)
+
+    if last_activity is not None and (now - float(last_activity)) >= SESSION_INACTIVITY_TIMEOUT:
+        logger.info(f"Session expired due to inactivity ({now - float(last_activity):.1f}s >= {SESSION_INACTIVITY_TIMEOUT}s).")
+        _clear_session_data(request)
+        if is_api:
+            return JSONResponse({"success": False, "error": "session_expired"}, status_code=401)
+        return RedirectResponse(url="/login?reason=expired", status_code=302)
+
+    request.session["last_activity"] = now
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Centralized AI Client Management & Multi-Key Failover
+# Supported slots: GROQ_API_KEY_1, GROQ_API_KEY_2, GROQ_API_KEY_3
+# Backward compatibility: GROQ_API_KEY
+# ---------------------------------------------------------------------------
+_groq_client_cache: dict[str, OpenAI] = {}
+
+
+def get_configured_groq_keys() -> list[str]:
+    """Returns list of configured non-empty Groq API keys in preference order (Slot 1 -> Slot 2 -> Slot 3)."""
+    keys = []
+    # Slot 1: GROQ_API_KEY_1 with fallback to legacy GROQ_API_KEY
+    k1 = os.environ.get("GROQ_API_KEY_1", "").strip() or os.environ.get("GROQ_API_KEY", "").strip()
+    if k1:
+        keys.append(k1)
+    k2 = os.environ.get("GROQ_API_KEY_2", "").strip()
+    if k2 and k2 not in keys:
+        keys.append(k2)
+    k3 = os.environ.get("GROQ_API_KEY_3", "").strip()
+    if k3 and k3 not in keys:
+        keys.append(k3)
+    return keys
+
+
+def get_groq_client(api_key: str) -> OpenAI:
+    """Returns cached OpenAI client configured for Groq base URL."""
+    if api_key not in _groq_client_cache:
+        _groq_client_cache[api_key] = OpenAI(
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
+            timeout=30.0,
+            max_retries=0,  # We manage bounded key-slot failover explicitly
+        )
+    return _groq_client_cache[api_key]
+
+
+def _is_retryable_ai_error(exc: Exception) -> bool:
+    """
+    Identifies temporary/retryable AI API errors:
+    - HTTP 429 rate limit / TPM exceeded
+    - HTTP 401 / 403 invalid/expired/unauthorized key
+    - HTTP 500, 502, 503, 504 server/gateway errors
+    - Network timeouts and connection drops
+    """
+    import openai
+    if isinstance(exc, (openai.RateLimitError, openai.AuthenticationError, openai.PermissionDeniedError,
+                        openai.InternalServerError, openai.APIConnectionError, openai.APITimeoutError)):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status in (429, 401, 403, 500, 502, 503, 504):
+        return True
+    err_str = str(exc).lower()
+    if any(marker in err_str for marker in ("rate limit", "429", "tpm", "quota", "timeout", "connection error", "503", "502")):
+        return True
+    return False
+
+
+def call_groq_chat_with_fallback(messages: list[dict], **kwargs):
+    """
+    Executes a chat completion with failover across configured GROQ API key slots (1 -> 2 -> 3).
+    Only logs credential slot indices; never logs or exposes API keys or secrets.
+    """
+    keys = get_configured_groq_keys()
+    if not keys:
+        logger.error("No Groq API keys configured.")
+        raise RuntimeError("AI service is not configured.")
+
+    last_error = None
+    for slot_idx, key in enumerate(keys, start=1):
+        try:
+            client = get_groq_client(key)
+            logger.info(f"Attempting AI request using credential slot {slot_idx}...")
+            return client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                **kwargs
+            )
+        except Exception as exc:
+            last_error = exc
+            if _is_retryable_ai_error(exc):
+                status_code = getattr(exc, "status_code", "temporary/network")
+                logger.warning(
+                    f"AI request failed on credential slot {slot_idx} (status: {status_code}). "
+                    f"{'Trying next slot...' if slot_idx < len(keys) else 'All configured slots exhausted.'}"
+                )
+                continue
+            else:
+                logger.error(f"Non-retryable AI error on credential slot {slot_idx}: {type(exc).__name__}")
+                raise exc
+
+    logger.error(f"All {len(keys)} configured AI credential slots failed. Last error: {type(last_error).__name__}")
+    raise RuntimeError("AI service is temporarily busy. Please try again shortly.")
+
+
+def call_groq_transcribe_with_fallback(audio_file_tuple, prompt: str, **kwargs):
+    """
+    Executes voice transcription with failover across configured GROQ API key slots (1 -> 2 -> 3).
+    """
+    keys = get_configured_groq_keys()
+    if not keys:
+        logger.error("No Groq API keys configured for voice transcription.")
+        raise RuntimeError("Voice service is not configured.")
+
+    last_error = None
+    for slot_idx, key in enumerate(keys, start=1):
+        try:
+            client = get_groq_client(key)
+            logger.info(f"Attempting voice transcription using credential slot {slot_idx}...")
+            return client.audio.transcriptions.create(
+                file=audio_file_tuple,
+                model=GROQ_STT_MODEL,
+                response_format="json",
+                temperature=0,
+                prompt=prompt,
+                **kwargs
+            )
+        except Exception as exc:
+            last_error = exc
+            if _is_retryable_ai_error(exc):
+                status_code = getattr(exc, "status_code", "temporary/network")
+                logger.warning(
+                    f"Voice transcription failed on credential slot {slot_idx} (status: {status_code}). "
+                    f"{'Trying next slot...' if slot_idx < len(keys) else 'All configured slots exhausted.'}"
+                )
+                continue
+            else:
+                logger.error(f"Non-retryable voice transcription error on slot {slot_idx}: {type(exc).__name__}")
+                raise exc
+
+    logger.error(f"All {len(keys)} configured voice credential slots failed. Last error: {type(last_error).__name__}")
+    raise RuntimeError("Voice service is temporarily busy. Please try again shortly.")
+
 
 ALLOWED_TABLES = db_schema.ALLOWED_TABLES
 IDENTITY_COLUMNS = {"ECODE", "EMP_NAME"}
@@ -202,6 +436,94 @@ def _is_plain_total_request(text):
     return len(leftover) == 0
 
 
+def _is_salary_aggregate_intent(message):
+    """
+    Detects whether the user question is asking for a salary aggregate
+    (SUM, AVG, MIN, MAX of salary) rather than a simple COUNT of employees.
+    This must fire BEFORE the count shortcut to prevent misrouting.
+    Returns True if salary aggregate intent is detected.
+    """
+    text = str(message or "").strip().lower()
+    # Salary-related keywords across all three languages
+    salary_words = (
+        "salary", "salaries", "tankhwa", "tankha", "tankhwah", "payroll",
+        "\u062a\u0646\u062e\u0648\u0627\u06c1",  # تنخواہ
+    )
+    # Aggregate operation keywords across all three languages
+    agg_cues = (
+        "total salary", "sum salary", "sum of salary", "total payroll",
+        "total tankhwa", "kul tankhwa", "kul salary", "total tankha",
+        "average salary", "avg salary", "mean salary",
+        "average tankhwa", "ausat salary", "ausat tankhwa",
+        "highest salary", "lowest salary", "maximum salary", "minimum salary",
+        "sab se zyada salary", "sab se kam salary",
+        "sab se zyada tankhwa", "sab se kam tankhwa",
+        # Urdu script patterns
+        "\u06a9\u0644 \u062a\u0646\u062e\u0648\u0627\u06c1",      # کل تنخواہ
+        "\u0627\u0648\u0633\u0637 \u062a\u0646\u062e\u0648\u0627\u06c1",  # اوسط تنخواہ
+        "\u0632\u06cc\u0627\u062f\u06c1 \u062a\u0646\u062e\u0648\u0627\u06c1",  # زیادہ تنخواہ
+        "\u06a9\u0645 \u062a\u0646\u062e\u0648\u0627\u06c1",      # کم تنخواہ
+    )
+    # Check for explicit aggregate + salary phrases
+    if any(cue in text for cue in agg_cues):
+        return True
+    # Check for aggregate operation word near a salary word
+    agg_ops = (
+        "total", "sum", "average", "avg", "mean", "ausat",
+        "\u06a9\u0644",    # کل
+        "\u0627\u0648\u0633\u0637",  # اوسط
+    )
+    has_salary = any(sw in text for sw in salary_words)
+    has_agg = any(op in text for op in agg_ops)
+    if has_salary and has_agg:
+        return True
+    return False
+
+
+def _has_extra_filters(message):
+    """
+    Detects whether a count-like question has additional filters beyond
+    just a department/designation name (e.g., gender, city, salary threshold).
+    If so, the simple count shortcut should be bypassed.
+    """
+    text = str(message or "").strip().lower()
+    extra_filter_cues = (
+        # Gender
+        "female", "male", "khawateen", "khateen", "mard",
+        "\u062e\u0648\u0627\u062a\u06cc\u0646",  # خواتین
+        "\u0645\u0631\u062f",                      # مرد
+        # City indicators
+        "faisalabad", "lahore", "karachi", "islamabad", "rawalpindi",
+        "peshawar", "quetta", "multan", "gujranwala", "sialkot",
+        "hyderabad", "sargodha", "bahawalpur", "mardan", "sukkur",
+        "gujrat", "jhang", "kasur", "sheikhupura", "larkana",
+        "\u0641\u06cc\u0635\u0644 \u0622\u0628\u0627\u062f",  # فیصل آباد
+        "\u0644\u0627\u06c1\u0648\u0631",              # لاہور
+        "\u06a9\u0631\u0627\u0686\u06cc",              # کراچی
+        "\u0627\u0633\u0644\u0627\u0645 \u0622\u0628\u0627\u062f",  # اسلام آباد
+        # Salary threshold
+        "salary above", "salary below", "salary greater", "salary less",
+        "salary se zyada", "salary se kam", "salary zyada",
+        "\u062a\u0646\u062e\u0648\u0627\u06c1 \u0632\u06cc\u0627\u062f\u06c1",  # تنخواہ زیادہ
+        "\u062a\u0646\u062e\u0648\u0627\u06c1 \u06a9\u0645",              # تنخواہ کم
+        # Explicit combined-filter cues
+        "from", "se hain", "se hai",
+    )
+    # Check for salary numeric thresholds like "above 80000" or "se zyada hai"
+    if re.search(r"salary.*\d{4,}", text) or re.search(r"\d{4,}.*salary", text):
+        return True
+    if re.search(r"\u062a\u0646\u062e\u0648\u0627\u06c1.*\d{4,}", text):  # تنخواہ + number
+        return True
+    # Check if multiple filter categories are mentioned
+    filter_count = sum(1 for cue in extra_filter_cues if cue in text)
+    # Having gender + city, or gender + department already implies multi-filter
+    gender_present = any(g in text for g in ("female", "male", "khawateen", "mard",
+                                              "\u062e\u0648\u0627\u062a\u06cc\u0646", "\u0645\u0631\u062f"))
+    if gender_present:
+        return True
+    return filter_count >= 2
+
+
 def _count_query_for(message, department_names=None, designation_names=None):
     """Count request mein entity aur filter ko alag pehchanta hai."""
     text = str(message or "").strip().lower()
@@ -214,6 +536,10 @@ def _count_query_for(message, department_names=None, designation_names=None):
 
     # Employees target hon to department/designation sirf filter hota hai.
     if any(x in text for x in employees):
+        # Multi-filter detection: agar gender, city, salary threshold jaisi
+        # extra conditions bhi hon to simple count shortcut bypass karo.
+        if _has_extra_filters(text):
+            return None  # Let AI generate the full SQL with all conditions
         department = _named_reference_in_message(text, department_names or [])
         designation = _named_reference_in_message(text, designation_names or [])
         if designation:
@@ -268,24 +594,6 @@ def _detect_typed_language(message):
     return None
 
 
-def get_connection():
-    """
-    Current logged-in Oracle user ke credentials se connection banata hai.
-    AI ko credentials nahi milte; connection hamesha Python banata hai.
-    """
-    login_token = session.get("db_login_token")
-    credentials = ACTIVE_DB_LOGINS.get(login_token)
-
-    if not credentials:
-        raise RuntimeError("Database login session available nahi hai. Please dobara login karein.")
-
-    dsn = oracledb.makedsn(DB_HOST, DB_PORT, service_name=DB_SERVICE)
-
-    return oracledb.connect(
-        user=credentials["username"],
-        password=credentials["password"],
-        dsn=dsn
-    )
 
 
 def _display_value(label, value):
@@ -558,7 +866,7 @@ def classify_and_respond(message, history=None, preferred_language=None):
     3) employee-data question ho to SELECT query generate karta hai
     """
 
-    if groq_client is None:
+    if not get_configured_groq_keys():
         raise RuntimeError(
             "GROQ_API_KEY .env file mein set nahi hai. "
             "Project folder ki .env file mein apni Groq API key add karein."
@@ -628,12 +936,18 @@ SELECTED LANGUAGE MODE:
   "Meherbani karke employee ka ECODE ya naam batayein."
 - Mixed Roman Urdu and English input is LANG=UR by default.
 - If the input is neither Urdu nor Roman Urdu, use LANG=EN and reply in clear, simple professional English.
-- For casual greetings or small talk, reply warmly and naturally in the user's language.
-- During the first 2 or 3 consecutive casual exchanges, do NOT mention employee data or your capabilities; simply continue the conversation naturally.
+- For casual greetings or small talk, reply warmly, enthusiastically and naturally in the user's language like a friendly, cheerful colleague.
+- Your casual personality is warm, upbeat, and genuinely caring. You sound like a real person who is happy to chat — never robotic, stiff, or generic.
+- During the first 2 or 3 consecutive casual exchanges, do NOT mention employee data or your capabilities; simply continue the conversation naturally and warmly.
 - Only around the 3rd or 4th consecutive casual user message, add one short reminder in simple words that you can also help with employee information.
 - Do not repeat that reminder again unless several more casual turns have passed.
-- You may occasionally use one suitable friendly emoji in casual conversation, but do not use an emoji in every reply and never use more than one.
-- Keep casual replies concise; do not list every capability unless the user asks.
+- Use 1–2 friendly emojis naturally in most casual replies (e.g. 😊 🙌 👋 💯 😄 🤝 ❤️ 🎉 👍). Emojis should feel organic, not forced. You may skip emojis occasionally for variety, but generally include at least one.
+- When someone shares their name (e.g. "mera naam Fasih hai"), respond with genuine warmth — compliment the name, greet them by name, and ask a friendly follow-up. Example: "Fasih bhai! Bohat pyara naam hai 😊 Kaise hain aap? Umeed hai sab acha chal raha hoga!"
+- When someone says "theek hoon" or "I'm fine", don't just say "glad to hear" — add a warm follow-up like asking about their day or sharing a positive vibe.
+- For greetings like "hi", "hello", "salam", "kaise ho", give enthusiastic and warm replies, not just a plain "hello". Make the person feel welcomed.
+- Ask casual follow-up questions naturally to keep the conversation flowing (e.g. "Aapka din kaisa ja raha hai?", "How's your day going?").
+- Keep casual replies concise but heartfelt; do not list every capability unless the user asks.
+- Match the user's energy and tone — if they are excited, be excited back; if they are relaxed, be chill and friendly.
 - If the user explicitly asks for an English answer (for example "English mein jawab do"), use LANG=EN.
 - If "English mein jawab do" is a follow-up to the previous answer, classify it as CHAT and
   return that previous answer translated into natural English without querying the database again.
@@ -749,12 +1063,32 @@ CONTENT:SELECT COUNT(*) AS TOTAL_ACCOUNTS_MANAGER_EMPLOYEES FROM EMPLOYEES e, DE
 User: hi
 TYPE:CHAT
 LANG:EN
-CONTENT:Hi! How are you doing? 🙂
+CONTENT:Hey there! Welcome! 😊 How's everything going with you today?
+
+User: hello, kaise ho
+TYPE:CHAT
+LANG:UR
+CONTENT:Assalam o Alaikum! Main bohat acha hoon, shukriya 😄 Aap sunayein, kya haal hain aapke?
 
 User: main theek hoon, aap kaise hain
 TYPE:CHAT
 LANG:UR
-CONTENT:Main bhi bilkul theek hoon, shukriya! Aap ka din kaisa ja raha hai?
+CONTENT:Alhamdulillah! Main bhi bilkul shandar hoon 🙌 Bohat acha laga sun ke ke aap theek hain. Aapka din kaisa guzar raha hai?
+
+User: mera naam Muhammad Fasih hai
+TYPE:CHAT
+LANG:UR
+CONTENT:Fasih bhai! Mashallah, bohat pyara naam hai 😊 Bohat khushi hui aap se mil kar! Kaise hain aap, sab kheriyat?
+
+User: shukriya, acha laga
+TYPE:CHAT
+LANG:UR
+CONTENT:Arey bilkul! Mujhe bhi bohat acha laga aap se baat kar ke 🤝 Waise agar kabhi employee data ke baare mein kuch jaanna ho, toh main hamesha hazir hoon!
+
+User: thank you so much
+TYPE:CHAT
+LANG:EN
+CONTENT:You're most welcome! Always happy to help 😊 Feel free to ask me anything anytime!
 
 User: employee ka CNIC number batao
 TYPE:DOMAIN
@@ -780,10 +1114,9 @@ CONTENT:OUT_OF_SCOPE
 
     messages.append({"role": "user", "content": message})
 
-    response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
+    response = call_groq_chat_with_fallback(
         messages=messages,
-        temperature=0
+        temperature=0.3
     )
 
     text = response.choices[0].message.content.strip()
@@ -932,38 +1265,59 @@ def TOO_MANY_RESULTS_MESSAGE_(lang):
     return random.choice(TOO_MANY_RESULTS_MESSAGE_VARIANTS.get(lang, TOO_MANY_RESULTS_MESSAGE_VARIANTS["EN"]))
 
 
-def handle_message(message, history=None, preferred_language=None):
+def handle_message(message, history=None, preferred_language=None, return_sql=False):
     message = (message or "").strip()
     message = _normalize_stt_artifacts(message)
 
     if not message:
-        return "Please type something first."
+        res = "Please type something first."
+        return (res, "") if return_sql else res
 
     early_lang = preferred_language if preferred_language in ("EN", "UR") else _detect_typed_language(message) or "EN"
 
     if _is_oversized_list_request(message):
-        return TOO_MANY_RESULTS_MESSAGE_(early_lang)
+        res = TOO_MANY_RESULTS_MESSAGE_(early_lang)
+        return (res, "") if return_sql else res
 
-    count_sql = None
-    count_markers = ("how many", "total", "count", "kitne", "kitni", "tadaad", "\u06a9\u062a\u0646\u06d2", "\u06a9\u062a\u0646\u06cc", "\u062a\u0639\u062f\u0627\u062f")
-    if any(marker in message.lower() for marker in count_markers):
-        try:
-            department_names, designation_names = _reference_names()
-            count_sql = _count_query_for(message, department_names, designation_names)
-        except Exception as exc:
-            return f"Database error: {str(exc)}"
-    if count_sql:
-        try:
-            columns, rows, _ = run_query(count_sql)
-        except Exception as exc:
-            return f"Database error: {str(exc)}"
-        answer = format_answer(columns, rows, lang=early_lang, question=message)
-        return answer or NO_RESULT_MESSAGE_(early_lang)
+    # ---------------------------------------------------------------------------
+    # Priority 1: Detect salary-aggregate intents (SUM, AVG, MIN, MAX) BEFORE
+    # any count shortcut. These must always go to the AI for proper SQL generation.
+    # ---------------------------------------------------------------------------
+    if _is_salary_aggregate_intent(message):
+        # Skip count shortcut entirely; let AI generate the correct aggregate SQL.
+        pass
+    else:
+        # Priority 2: Simple count shortcut (only for genuine count-of-employees queries)
+        count_sql = None
+        count_markers = ("how many", "total", "count", "kitne", "kitni", "tadaad", "\u06a9\u062a\u0646\u06d2", "\u06a9\u062a\u0646\u06cc", "\u062a\u0639\u062f\u0627\u062f")
+        if any(marker in message.lower() for marker in count_markers):
+            try:
+                department_names, designation_names = _reference_names()
+                count_sql = _count_query_for(message, department_names, designation_names)
+            except Exception as exc:
+                logger.error(f"Database count query error: {exc}")
+                res = "Database connection is unavailable."
+                return (res, "") if return_sql else res
+        if count_sql:
+            try:
+                columns, rows, _ = run_query(count_sql)
+            except Exception as exc:
+                logger.error(f"Count query execution error: {exc}")
+                res = "Database connection is unavailable."
+                return (res, "") if return_sql else res
+            answer = format_answer(columns, rows, lang=early_lang, question=message)
+            res = answer or NO_RESULT_MESSAGE_(early_lang)
+            return (res, count_sql) if return_sql else res
 
     try:
         result = classify_and_respond(message, history=history, preferred_language=preferred_language)
     except Exception as exc:
-        return f"AI error: {str(exc)}"
+        logger.error(f"AI classification error: {exc}")
+        if "AI service is" in str(exc):
+            res = str(exc)
+        else:
+            res = "AI service is temporarily busy. Please try again shortly."
+        return (res, "") if return_sql else res
 
     msg_type = result["type"]
     lang = preferred_language if preferred_language in ("EN", "UR") else result["lang"] if result["lang"] in ("EN", "UR") else "EN"
@@ -973,18 +1327,22 @@ def handle_message(message, history=None, preferred_language=None):
         content = _sanitize_roman_urdu(content)
 
     if msg_type == "CHAT":
-        return content
+        return (content, "") if return_sql else content
 
     if msg_type == "DOMAIN":
         if _is_data_change_request(message):
             if lang == "UR":
-                return "Maazrat, main employee records mein tabdeeli nahi kar sakta. Main maujooda maloomat dekh kar bata sakta hoon."
-            return "Sorry, I can't change employee records, but I can help you view the information that's already there."
+                res = "Maazrat, main employee records mein tabdeeli nahi kar sakta. Main maujooda maloomat dekh kar bata sakta hoon."
+            else:
+                res = "Sorry, I can't change employee records, but I can help you view the information that's already there."
+            return (res, "") if return_sql else res
         if content.strip().upper() == "OUT_OF_SCOPE":
-            return DOMAIN_MESSAGE_(lang)
+            res = DOMAIN_MESSAGE_(lang)
+            return (res, "") if return_sql else res
         if content and content.upper() != "NONE":
-            return content
-        return DOMAIN_MESSAGE_(lang)
+            return (content, "") if return_sql else content
+        res = DOMAIN_MESSAGE_(lang)
+        return (res, "") if return_sql else res
 
     if content.endswith(";"):
         content = content[:-1].strip()
@@ -993,194 +1351,252 @@ def handle_message(message, history=None, preferred_language=None):
 
     if not is_valid:
         if lang == "UR":
-            return "Maazrat, main is darkhwast par amal nahi kar sakta. Aap employee ki maujooda maloomat pooch sakte hain."
-        return "Sorry, I can't carry out that request. You can ask me about existing employee information."
+            res = "Maazrat, main is darkhwast par amal nahi kar sakta. Aap employee ki maujooda maloomat pooch sakte hain."
+        else:
+            res = "Sorry, I can't carry out that request. You can ask me about existing employee information."
+        return (res, "") if return_sql else res
 
     try:
         columns, rows, has_more_rows = run_query(content)
     except Exception as exc:
-        return f"Database error: {str(exc)}"
+        logger.error(f"Run query execution error: {exc}")
+        res = "Database connection is unavailable."
+        return (res, content) if return_sql else res
 
     if has_more_rows:
-        return TOO_MANY_RESULTS_MESSAGE_(lang)
+        res = TOO_MANY_RESULTS_MESSAGE_(lang)
+        return (res, content) if return_sql else res
 
     answer = format_answer(columns, rows, lang=lang, question=message)
 
     if not answer:
-        return NO_RESULT_MESSAGE_(lang)
+        res = NO_RESULT_MESSAGE_(lang)
+        return (res, content) if return_sql else res
 
-    return answer
+    return (answer, content) if return_sql else answer
 
 
-@app.route("/", methods=["GET"])
-def home():
-    if not session.get("logged_in"):
-        return redirect(url_for("login"))
+# ============================================================================
+# FastAPI Routes
+# ============================================================================
 
-    session["chat_history"] = [
-        {
-            "sender": "bot",
-            "text": (
-                "Hello! Ask me anything about the available employee data."
-            )
+import logging
+logger = logging.getLogger("research_agent")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    auth_redirect = _check_session_auth(request, is_api=False)
+    if auth_redirect:
+        return auth_redirect
+
+    if "chat_history" not in request.session:
+        request.session["chat_history"] = [
+            {
+                "sender": "bot",
+                "text": "Hello! Ask me anything about employee data 😊"
+            }
+        ]
+
+    return templates.TemplateResponse(
+        request=request,
+        name="chat.html",
+        context={
+            "history": request.session.get("chat_history", []),
+            "db_username": request.session.get("db_username"),
+            "session_timeout_seconds": SESSION_INACTIVITY_TIMEOUT,
         }
-    ]
-
-    return render_template(
-        "chat.html",
-        history=session["chat_history"],
-        db_username=session.get("db_username")
     )
 
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    """
-    Login page par diya gaya username/password Python direct Oracle ko verify karta hai.
+@app.get("/login", response_class=HTMLResponse)
+async def login_get(request: Request):
+    # If already logged in and active, redirect to home
+    logged_in = request.session.get("logged_in")
+    login_token = request.session.get("db_login_token")
+    last_activity = request.session.get("last_activity")
+    import time
+    now = time.time()
+    if logged_in and login_token and login_token in ACTIVE_DB_LOGINS:
+        if last_activity is not None and (now - float(last_activity)) < SESSION_INACTIVITY_TIMEOUT:
+            return RedirectResponse(url="/", status_code=302)
 
-    Username:
-    - strip + upper kiya jata hai, is liye research / Research / RESEARCH same hain.
+    error = None
+    error_type = None
+    reason = request.query_params.get("reason")
+    if reason in ("inactive", "expired"):
+        error = "Your session has expired due to inactivity. Please log in again."
+        error_type = "session_expired"
 
-    Password:
-    - Is research app mein password ko bhi uppercase normalize kiya jata hai.
-    - Is liye NTU / ntu / Ntu ko NTU ke taur par Oracle ko bheja jata hai.
-    - Ye tab sahi hai jab Oracle password uppercase form mein bana ho, jaise NTU.
+    return templates.TemplateResponse(
+        request=request,
+        name="login.html",
+        context={
+            "error": error,
+            "error_type": error_type,
+        }
+    )
 
-    AI ko username/password nahi bheja jata.
-    """
+
+@app.post("/login", response_class=HTMLResponse)
+async def login_post(
+    request: Request,
+    username: str = Form(""),
+    password: str = Form(""),
+):
     error = None
     error_type = None
 
-    if request.method == "POST":
-        username = request.form.get("username", "").strip().upper()
-        password = request.form.get("password", "").strip().upper()
+    username = username.strip().upper()
+    password = password.strip().upper()
 
-        try:
-            dsn = oracledb.makedsn(
-                DB_HOST,
-                DB_PORT,
-                service_name=DB_SERVICE
-            )
+    try:
+        dsn = oracledb.makedsn(
+            DB_HOST,
+            DB_PORT,
+            service_name=DB_SERVICE
+        )
 
-            # Python khud Oracle se login verify karta hai.
-            # Username aur password dono uppercase normalize kiye gaye hain
-            # taa-ke RESEARCH/research aur NTU/ntu same treat hon.
-            test_connection = oracledb.connect(
-                user=username,
-                password=password,
-                dsn=dsn
-            )
+        test_connection = oracledb.connect(
+            user=username,
+            password=password,
+            dsn=dsn
+        )
 
-            # Sirf connection open hona nahi, ek chhota DB test bhi karte hain.
-            test_cursor = test_connection.cursor()
-            test_cursor.execute("SELECT USER FROM DUAL")
-            logged_db_user = test_cursor.fetchone()[0]
-            test_cursor.close()
-            test_connection.close()
+        test_cursor = test_connection.cursor()
+        test_cursor.execute("SELECT USER FROM DUAL")
+        logged_db_user = test_cursor.fetchone()[0]
+        test_cursor.close()
+        test_connection.close()
 
-            # Password Flask cookie/session mein nahi rakhte.
-            # Sirf random token cookie mein jata hai; credentials Python memory mein rehte hain.
-            login_token = secrets.token_urlsafe(32)
-            ACTIVE_DB_LOGINS[login_token] = {
-                "username": logged_db_user,
-                "password": password
+        import time
+        login_token = secrets.token_urlsafe(32)
+        ACTIVE_DB_LOGINS[login_token] = {
+            "username": logged_db_user,
+            "password": password
+        }
+
+        _clear_session_data(request)
+        request.session["logged_in"] = True
+        request.session["db_username"] = logged_db_user
+        request.session["db_login_token"] = login_token
+        request.session["last_activity"] = time.time()
+        request.session["chat_history"] = [
+            {
+                "sender": "bot",
+                "text": "Hello! Ask me anything about employee data 😊"
             }
+        ]
 
-            session.clear()
-            session["logged_in"] = True
-            session["db_username"] = logged_db_user
-            session["db_login_token"] = login_token
+        return RedirectResponse(url="/", status_code=302)
 
-            return redirect(url_for("home"))
+    except oracledb.DatabaseError as exc:
+        error_obj = exc.args[0] if exc.args else None
+        error_code = getattr(error_obj, "code", None)
+        error_message = getattr(error_obj, "message", str(exc))
 
-        except oracledb.DatabaseError as exc:
-            error_obj = exc.args[0] if exc.args else None
-            error_code = getattr(error_obj, "code", None)
-            error_message = getattr(error_obj, "message", str(exc))
-
-            if error_code == 1017:
-                error_type = "invalid_credentials"
-                error = "Invalid Credentials"
-            else:
-                error_type = "generic"
-                error = f"Oracle error: {error_message}"
-        except Exception as exc:
+        if error_code == 1017:
+            error_type = "invalid_credentials"
+            error = "Invalid Credentials"
+        else:
             error_type = "generic"
-            error = f"Connection error: {str(exc)}"
+            error = "Oracle database connection could not be established."
+    except Exception as exc:
+        error_type = "generic"
+        error = "Database connection error."
 
-    return render_template(
-        "login.html",
-        error=error,
-        error_type=error_type
+    return templates.TemplateResponse(
+        request=request,
+        name="login.html",
+        context={
+            "error": error,
+            "error_type": error_type,
+        }
     )
 
 
-@app.route("/logout")
-def logout():
+@app.get("/logout")
+@app.post("/logout")
+async def logout(request: Request):
     """
     Sign out = research database login session fully disconnect.
-
-    Query connections are already closed after every query in run_query().
-    Yahan active login token + in-memory credentials + Flask session/chat
-    sab clear kar diye jate hain.
+    Clears active login token + in-memory credentials + session data.
     """
-    login_token = session.get("db_login_token")
+    _clear_session_data(request)
+    reason = request.query_params.get("reason")
 
-    if login_token:
-        credentials = ACTIVE_DB_LOGINS.pop(login_token, None)
-        if credentials is not None:
-            # Password reference ko overwrite/remove karne ki best-effort cleanup.
-            credentials["password"] = None
-            credentials.clear()
+    accept = request.headers.get("accept", "")
+    if "application/json" in accept:
+        return JSONResponse({"success": True, "message": "Logged out successfully"})
 
-    session.clear()
-    return redirect(url_for("login"))
+    redirect_url = f"/login?reason={reason}" if reason else "/login"
+    return RedirectResponse(url=redirect_url, status_code=302)
 
 
-@app.route("/api/transcribe", methods=["POST"])
-def transcribe_voice():
+@app.post("/api/transcribe")
+async def transcribe_voice(request: Request, audio: UploadFile = File(None)):
     """English, Urdu, or mixed voice ko automatically text mein transcribe karta hai."""
-    if not session.get("logged_in"):
-        return jsonify({"error": "not_logged_in"}), 401
+    auth_check = _check_session_auth(request, is_api=True)
+    if auth_check:
+        return auth_check
 
-    if groq_client is None:
-        return jsonify({"error": "Voice service is not configured."}), 503
+    if not get_configured_groq_keys():
+        return JSONResponse({"error": "Voice service is not configured."}, status_code=503)
 
-    audio_file = request.files.get("audio")
-    if audio_file is None:
-        return jsonify({"error": "No voice recording was received."}), 400
+    if audio is None:
+        return JSONResponse({"error": "No voice recording was received."}, status_code=400)
 
-    audio_bytes = audio_file.stream.read(10 * 1024 * 1024 + 1)
+    audio_bytes = await audio.read(10 * 1024 * 1024 + 1)
     if not audio_bytes:
-        return jsonify({"error": "The voice recording is empty."}), 400
+        return JSONResponse({"error": "The voice recording is empty."}, status_code=400)
     if len(audio_bytes) > 10 * 1024 * 1024:
-        return jsonify({"error": "Voice recording is too large."}), 413
+        return JSONResponse({"error": "Voice recording is too large."}, status_code=413)
 
     try:
-        transcription = groq_client.audio.transcriptions.create(
-            file=(audio_file.filename or "voice.webm", audio_bytes, audio_file.mimetype or "audio/webm"),
-            model=GROQ_STT_MODEL,
-            response_format="json",
-            temperature=0,
-            prompt=(
-                "An employee database question spoken naturally in English, Urdu, "
-                "Roman Urdu, or mixed Urdu-English. Preserve the speaker's words and language."
-            )
+        audio_file_tuple = (audio.filename or "voice.webm", audio_bytes, audio.content_type or "audio/webm")
+        prompt = (
+            "An employee database question spoken naturally in English, Urdu, "
+            "Roman Urdu, or mixed Urdu-English. Preserve the speaker's words and language."
+        )
+        transcription = call_groq_transcribe_with_fallback(
+            audio_file_tuple=audio_file_tuple,
+            prompt=prompt
         )
         transcript = (getattr(transcription, "text", "") or "").strip()
         if not transcript:
-            return jsonify({"error": "No speech was detected. Please try again."}), 422
-        return jsonify({"transcript": transcript})
+            return JSONResponse({"error": "No speech was detected. Please try again."}, status_code=422)
+        return JSONResponse({"transcript": transcript})
     except Exception as exc:
-        return jsonify({"error": f"Voice transcription error: {str(exc)}"}), 502
+        logger.error(f"Voice transcription error: {exc}")
+        if "Voice service is" in str(exc):
+            return JSONResponse({"error": str(exc)}, status_code=503)
+        return JSONResponse({"error": "Voice service is temporarily busy. Please try again shortly."}, status_code=502)
 
 
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
-    if not session.get("logged_in"):
-        return jsonify({"error": "not_logged_in"}), 401
+@app.post("/api/heartbeat")
+@app.get("/api/heartbeat")
+async def api_heartbeat(request: Request):
+    """
+    Keepalive endpoint called while user is actively interacting with the UI
+    (mouse movements, clicks, typing, scrolling, voice recording, etc.).
+    Resets the server-side inactivity session timer.
+    """
+    auth_check = _check_session_auth(request, is_api=True)
+    if auth_check:
+        return auth_check
+    return JSONResponse({"success": True, "active": True})
 
-    data = request.get_json(silent=True) or {}
+
+@app.post("/api/chat")
+async def api_chat(request: Request):
+    auth_check = _check_session_auth(request, is_api=True)
+    if auth_check:
+        return auth_check
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
     message = data.get("message", "")
     message_source = str(data.get("source", "typed")).lower()
     preferred_language = str(data.get("language", "")).upper()
@@ -1189,19 +1605,44 @@ def api_chat():
     if message_source == "typed" and preferred_language is None:
         preferred_language = _detect_typed_language(message)
 
-    history = session.get("chat_history", [])
-    print(f"[DEBUG] raw message repr: {message!r}")
-    print(f"[DEBUG] normalized message repr: {_normalize_stt_artifacts(message)!r}")
-    reply = handle_message(message, history=history, preferred_language=preferred_language)
+    evaluation_mode = bool(data.get("evaluation_mode", False))
+
+    history = request.session.get("chat_history", [])
+
+    token = _current_session_ref.set(dict(request.session))
+    generated_sql = ""
+    try:
+        if evaluation_mode:
+            reply, generated_sql = handle_message(
+                message, history=history, preferred_language=preferred_language, return_sql=True
+            )
+        else:
+            reply = handle_message(
+                message, history=history, preferred_language=preferred_language, return_sql=False
+            )
+    except Exception as exc:
+        logger.error(f"Error handling message: {exc}")
+        reply = "Meherbani karke dobara koshish karein ya apna sawal thoda mukhtalif alfaaz mein poochein."
+        generated_sql = ""
+    finally:
+        _current_session_ref.reset(token)
 
     history.append({"sender": "user", "text": message})
     history.append({"sender": "bot", "text": reply})
-    session["chat_history"] = history[-16:]
+    request.session["chat_history"] = history[-16:]
 
-    return jsonify({"reply": reply})
+    response_data = {"reply": reply}
+    if evaluation_mode:
+        response_data["sql"] = generated_sql or ""
+    return JSONResponse(response_data)
 
+
+# ============================================================================
+# Entry Point
+# ============================================================================
 
 if __name__ == "__main__":
+    import uvicorn
     print(f"Oracle target: {DB_HOST}:{DB_PORT}/{DB_SERVICE}")
     print("Research Agent is starting...")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    uvicorn.run("app:app", host="127.0.0.1", port=5000, reload=False)

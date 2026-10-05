@@ -134,7 +134,8 @@ a{text-decoration:none;color:inherit}
 .primary-btn:hover{box-shadow:0 15px 32px rgba(15,111,122,.3)}
 .security-note{margin-top:18px;padding:12px 13px;border:1px solid var(--line);background:var(--surface-soft);border-radius:11px;display:flex;gap:9px;color:var(--muted);font-size:10.8px;line-height:1.5}
 .security-note svg{width:15px;flex:0 0 15px;color:var(--green);margin-top:1px}
-.alert{margin-bottom:17px;padding:11px 13px;border:1px solid #e8b4ae;background:#fbeeee;color:#a83b31;border-radius:11px;font-size:12px}
+.alert{margin-bottom:17px;padding:11px 14px;border:1px solid #fca5a5;background:#fef2f2;color:#dc2626;border-radius:11px;font-size:12.5px;font-weight:600;line-height:1.45}
+.alert svg{max-width:16px;max-height:16px;flex-shrink:0}
 
 .app-shell{height:100vh;height:100dvh;min-height:0;overflow:hidden;display:grid;grid-template-columns:264px minmax(0,1fr);background:var(--bg)}
 .sidebar{
@@ -414,7 +415,7 @@ html[data-theme="dark"] .orbit-core,html[data-theme="dark"] .orbit-tag{backgroun
 .theme-toggle .icon-sun{display:none}
 html[data-theme="dark"] .theme-toggle .icon-sun{display:block}
 html[data-theme="dark"] .theme-toggle .icon-moon{display:none}
-html[data-theme="dark"] .alert{border-color:#5a2d28;background:#2a1614;color:#f0b4ae}
+html[data-theme="dark"] .alert{border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.12);color:#f87171}
 
 .oracle-badge,.top-oracle{white-space:nowrap}
 .side-oracle{min-height:52px}
