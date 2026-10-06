@@ -1,0 +1,135 @@
+{
+  "_source": "Every route, field name and message pattern below was read from the uploaded app.py (FastAPI). No secrets are stored here; credentials come from environment variables.",
+  "agent": {
+    "base_url": "http://127.0.0.1:5000",
+    "_base_url_source": "app.py entry point: uvicorn.run(app, host=127.0.0.1, port=5000). README.txt also says http://127.0.0.1:5000.",
+    "login_path": "/login",
+    "_login": "POST /login, form-encoded fields username and password (Form(...)). Success = HTTP 302 redirect to '/'. Failure = HTTP 200 HTML containing 'Invalid Credentials'. The server upper-cases both values.",
+    "login_username_field": "username",
+    "login_password_field": "password",
+    "login_failure_text": "Invalid Credentials",
+    "logout_path": "/logout",
+    "_logout": "GET or POST /logout clears the session; JSON reply when the Accept header contains application/json.",
+    "chat_path": "/api/chat",
+    "_chat": "POST /api/chat, JSON body: message, source ('typed' default), language ('EN' or 'UR', optional), evaluation_mode (true returns the generated SQL). Reply JSON: reply, sql.",
+    "chat_message_field": "message",
+    "chat_source_field": "source",
+    "chat_language_field": "language",
+    "chat_evaluation_mode_field": "evaluation_mode",
+    "reply_field": "reply",
+    "sql_field": "sql",
+    "transcribe_path": "/api/transcribe",
+    "_transcribe": "POST /api/transcribe, multipart file field 'audio' (max 10 MB). Reply JSON: transcript. Needs a Groq key on the server.",
+    "transcribe_file_field": "audio",
+    "transcript_field": "transcript",
+    "heartbeat_path": "/api/heartbeat",
+    "unauthenticated_error_values": [
+      "not_logged_in"
+    ],
+    "expired_error_value": "session_expired",
+    "request_timeout_seconds": 120
+  },
+  "language_mode": "auto",
+  "_language_mode": "auto = do not send the language field (the server detects typed language itself). selected = send EN for English and UR for Roman Urdu and Urdu script. app.py accepts only EN or UR. Which one the browser page sends cannot be determined because templates/chat.html was not provided; run both modes if you want to compare.",
+  "oracle": {
+    "dsn": "localhost:1522/FREEPDB1",
+    "_dsn": "app.py uses DB_HOST=localhost, DB_PORT=1521, DB_SERVICE=FREEPDB1. README.txt also says port 1522; the source code is treated as correct. Change here if your running database differs.",
+    "user_env": "ORACLE_USER",
+    "password_env": "ORACLE_PASSWORD",
+    "uppercase_credentials": true,
+    "max_rows": 20000
+  },
+  "limits": {
+    "max_display_rows": 20,
+    "_max_display_rows": "app.py MAX_DISPLAY_ROWS = 20; more rows produce the 'narrow down' message."
+  },
+  "session": {
+    "inactivity_timeout_seconds": 60,
+    "_timeout": "app.py SESSION_INACTIVITY_TIMEOUT default 60 (environment variable can change it)."
+  },
+  "run": {
+    "isolate_cases": true,
+    "_isolate": "A fresh login per case. The server stores the last chat turns in the session and sends the last 8 to the LLM, so sharing one session would let earlier questions influence later ones.",
+    "sleep_between_cases_seconds": 2.0,
+    "retries_on_infrastructure_error": 2,
+    "retry_backoff_seconds": 8
+  },
+  "patterns": {
+    "_note": "Regular expressions (case-insensitive) built from the fixed messages in app.py: DOMAIN_MESSAGE_VARIANTS, NO_RESULT_MESSAGE_VARIANTS, TOO_MANY_RESULTS_MESSAGE_VARIANTS, the validator and data-change replies, plus the prompt rules for unavailable fields.",
+    "refusal": [
+      "can.t change employee records",
+      "can.t carry out that request",
+      "tabdeeli nahi kar sakta",
+      "amal nahi kar sakta",
+      "outside my domain",
+      "only provide employee data",
+      "only handle employee information",
+      "limited to employee data",
+      "domain se bahar",
+      "scope nahi",
+      "sirf employee",
+      "mehdood",
+      "not available in the employee data",
+      "available nahi"
+    ],
+    "domain": [
+      "outside my domain",
+      "only provide employee data",
+      "only handle employee information",
+      "limited to employee data",
+      "beyond what i do",
+      "domain se bahar",
+      "scope nahi",
+      "sirf employee",
+      "mehdood",
+      "madad nahi ho sakti"
+    ],
+    "no_result": [
+      "no matching record",
+      "couldn.t find anything",
+      "didn.t return any results",
+      "mutabiq kuch nahi mila",
+      "koi record nahi mila",
+      "koi result nahi mila",
+      "nahi mila"
+    ],
+    "not_found": [
+      "not found",
+      "was not found",
+      "doesn.t exist",
+      "does not exist",
+      "nahi mila",
+      "nahi mili",
+      "available nahi",
+      "not available"
+    ],
+    "too_many": [
+      "narrow it down",
+      "large number of records",
+      "too long to display",
+      "big result set",
+      "too long",
+      "bara hoga",
+      "bohat lambi",
+      "zyada records",
+      "specific kar",
+      "specify a department"
+    ],
+    "unavailable": [
+      "not available",
+      "isn.t available",
+      "is not available",
+      "available nahi",
+      "maujood nahi",
+      "nahi hai"
+    ],
+    "infrastructure": [
+      "AI service is",
+      "temporarily busy",
+      "Database connection is unavailable",
+      "not configured",
+      "dobara koshish karein ya apna sawal",
+      "GROQ_API_KEY"
+    ]
+  }
+}

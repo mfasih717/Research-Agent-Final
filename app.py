@@ -27,6 +27,7 @@ import os
 import re
 import random
 import secrets
+import time
 from decimal import Decimal
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -57,7 +58,7 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 # ---- Local Oracle 26ai Free Database ----
 # Thin mode use ho raha hai, is liye old Oracle client / Toad setup touch nahi hota.
 DB_HOST = "localhost"
-DB_PORT = 1521
+DB_PORT = 1522
 DB_SERVICE = "FREEPDB1"
 
 # Login credentials browser/session cookie mein password ke taur par store nahi hote.
@@ -211,40 +212,94 @@ def _is_retryable_ai_error(exc: Exception) -> bool:
     return False
 
 
+_EXHAUSTED_UNTIL = {}
+_LAST_KEY_ROTATION = 0
+
+
 def call_groq_chat_with_fallback(messages: list[dict], **kwargs):
     """
-    Executes a chat completion with failover across configured GROQ API key slots (1 -> 2 -> 3).
+    Executes a chat completion with failover across configured GROQ API key slots (1 -> 2 -> 3)
+    and graceful fallback between models (120b -> 20b).
     Only logs credential slot indices; never logs or exposes API keys or secrets.
     """
+    global _LAST_KEY_ROTATION
     keys = get_configured_groq_keys()
     if not keys:
         logger.error("No Groq API keys configured.")
         raise RuntimeError("AI service is not configured.")
 
-    last_error = None
-    for slot_idx, key in enumerate(keys, start=1):
-        try:
-            client = get_groq_client(key)
-            logger.info(f"Attempting AI request using credential slot {slot_idx}...")
-            return client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=messages,
-                **kwargs
-            )
-        except Exception as exc:
-            last_error = exc
-            if _is_retryable_ai_error(exc):
-                status_code = getattr(exc, "status_code", "temporary/network")
-                logger.warning(
-                    f"AI request failed on credential slot {slot_idx} (status: {status_code}). "
-                    f"{'Trying next slot...' if slot_idx < len(keys) else 'All configured slots exhausted.'}"
-                )
-                continue
-            else:
-                logger.error(f"Non-retryable AI error on credential slot {slot_idx}: {type(exc).__name__}")
-                raise exc
+    kwargs.setdefault("max_tokens", 400)
 
-    logger.error(f"All {len(keys)} configured AI credential slots failed. Last error: {type(last_error).__name__}")
+    models_to_try = [GROQ_MODEL]
+    if GROQ_MODEL != "openai/gpt-oss-20b" and "gpt-oss" in GROQ_MODEL:
+        models_to_try.append("openai/gpt-oss-20b")
+
+    _LAST_KEY_ROTATION += 1
+    n = len(keys)
+    rotated_slots = [(i % n + 1, keys[i % n]) for i in range(_LAST_KEY_ROTATION, _LAST_KEY_ROTATION + n)]
+
+    all_pairs = []
+    for model_name in models_to_try:
+        for slot_idx, key in rotated_slots:
+            all_pairs.append((model_name, slot_idx, key))
+
+    last_error = None
+    max_rounds = 2
+    for round_num in range(max_rounds):
+        now = time.time()
+        # Prefer pairs that are not currently cooling down
+        active_pairs = [p for p in all_pairs if now >= _EXHAUSTED_UNTIL.get((p[0], p[1]), 0)]
+        pairs_to_run = active_pairs if active_pairs else all_pairs
+
+        for model_name, slot_idx, key in pairs_to_run:
+            now = time.time()
+            if active_pairs and now < _EXHAUSTED_UNTIL.get((model_name, slot_idx), 0):
+                continue
+            try:
+                client = get_groq_client(key)
+                logger.info(f"Attempting AI request ({model_name}, slot {slot_idx})...")
+                return client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    **kwargs
+                )
+            except Exception as exc:
+                last_error = exc
+                err_str = str(exc).lower()
+                wait_sec = 5.0
+                match = re.search(r"try again in (\d+(?:\.\d+)?)\s*(ms|m|s)?", err_str)
+                if match:
+                    val = float(match.group(1))
+                    unit = (match.group(2) or "s").lower()
+                    if unit == "ms":
+                        wait_sec = max(1.0, val / 1000.0)
+                    elif unit == "m":
+                        wait_sec = val * 60.0
+                    else:
+                        wait_sec = val
+                elif "tokens per day" in err_str or "tpd" in err_str:
+                    wait_sec = 600.0
+
+                if "tokens per day" not in err_str and "tpd" not in err_str:
+                    wait_sec = min(wait_sec + 0.5, 15.0)
+
+                _EXHAUSTED_UNTIL[(model_name, slot_idx)] = time.time() + wait_sec
+
+                if _is_retryable_ai_error(exc):
+                    status_code = getattr(exc, "status_code", "temporary/network")
+                    logger.warning(
+                        f"AI request failed on {model_name} slot {slot_idx} (status: {status_code}): {exc}. Cooldown: {wait_sec:.1f}s."
+                    )
+                    continue
+                else:
+                    logger.error(f"Non-retryable AI error on {model_name} slot {slot_idx}: {type(exc).__name__}")
+                    raise exc
+
+        if round_num < max_rounds - 1:
+            logger.warning(f"All slots/models busy in round {round_num + 1}. Waiting 3s for token replenishment...")
+            time.sleep(3.0)
+
+    logger.error(f"All configured AI credential slots and models failed after {max_rounds} rounds. Last error: {type(last_error).__name__}")
     raise RuntimeError("AI service is temporarily busy. Please try again shortly.")
 
 
@@ -527,19 +582,36 @@ def _has_extra_filters(message):
 def _count_query_for(message, department_names=None, designation_names=None):
     """Count request mein entity aur filter ko alag pehchanta hai."""
     text = str(message or "").strip().lower()
-    if not any(x in text for x in ("how many", "total", "count", "kitne", "kitni", "tadaad", "\u06a9\u062a\u0646\u06d2", "\u06a9\u062a\u0646\u06cc", "\u062a\u0639\u062f\u0627\u062f")):
+
+    # Word boundary regex for count triggers (avoid matching 'accounts' or 'accountant' as 'count')
+    if not re.search(r"\b(how many|total|count|headcount|kitne|kitni|tadaad|\u06a9\u062a\u0646\u06d2|\u06a9\u062a\u0646\u06cc|\u062a\u0639\u062f\u0627\u062f)\b", text):
         return None
 
-    employees = ("employee", "employees", "staff", "banda", "bande", "banday", "log", "afrad", "\u0645\u0644\u0627\u0632\u0645", "\u0645\u0644\u0627\u0632\u0645\u06cc\u0646", "\u0628\u0646\u062f\u06d2", "\u0644\u0648\u06af", "\u0627\u06cc\u0645\u067e\u0644\u0627\u0626\u06cc\u0632")
+    # Bypass shortcut for queries that ask for specific attributes, conditions, rankings, or groupings
+    bypass_cues = (
+        "name", "names", "naam", "salary", "salaries", "tankhwa", "tankha",
+        "email", "address", "phone", "highest", "lowest", "sab se", "between",
+        "each", "har ", "mukhtalif", "different", "who", "kon", "kaun",
+        "\u06a9\u0648\u0646", "\u0646\u0627\u0645", "\u062a\u0646\u062e\u0648\u0627\u06c1", "\u06c1\u0631 ", "\u0645\u062e\u062a\u0644\u0641",
+        "earns", "working as", "kaam kar", "list", "dikhao",
+    )
+    if any(cue in text for cue in bypass_cues):
+        return None
+
+    employees = (
+        "employee", "employees", "staff", "banda", "bande", "banday", "log", "afrad", "headcount",
+        "\u0645\u0644\u0627\u0632\u0645", "\u0645\u0644\u0627\u0632\u0645\u06cc\u0646", "\u0628\u0646\u062f\u06d2", "\u0644\u0648\u06af",
+        "\u0627\u06cc\u0645\u067e\u0644\u0627\u0626\u06cc\u0632", "\u0627\u0641\u0631\u0627\u062f"
+    )
     departments = ("department", "departments", "dept", "\u0688\u06cc\u067e\u0627\u0631\u0679\u0645\u0646\u0679", "\u0634\u0639\u0628\u06d2")
     designations = ("designation", "designations", "desig", "job title", "\u0688\u06cc\u0632\u06af\u0646\u06cc\u0634\u0646", "\u0639\u06c1\u062f\u06d2")
 
-    # Employees target hon to department/designation sirf filter hota hai.
+    # Multi-filter detection: agar gender, city, salary threshold jaisi
+    # extra conditions bhi hon to simple count shortcut bypass karo.
+    if _has_extra_filters(text):
+        return None
+
     if any(x in text for x in employees):
-        # Multi-filter detection: agar gender, city, salary threshold jaisi
-        # extra conditions bhi hon to simple count shortcut bypass karo.
-        if _has_extra_filters(text):
-            return None  # Let AI generate the full SQL with all conditions
         department = _named_reference_in_message(text, department_names or [])
         designation = _named_reference_in_message(text, designation_names or [])
         if designation:
@@ -554,18 +626,16 @@ def _count_query_for(message, department_names=None, designation_names=None):
             return "SELECT COUNT(*) AS TOTAL_MANAGER_EMPLOYEES FROM EMPLOYEES e, DESIGNATIONS g WHERE e.DESG_CODE = g.DESG_CODE AND UPPER(g.DESG_NAME) LIKE '%MANAGER%'"
         if _is_plain_total_request(text):
             return "SELECT COUNT(*) AS TOTAL_EMPLOYEES FROM EMPLOYEES"
-        # Koi named department/designation match nahi mila, lekin message
-        # generic total se zyada lag raha hai (jaise Urdu script mein koi
-        # department ka naam). Blind total return karne ke bajaye None dete
-        # hain taake handle_message() ye AI (classify_and_respond) ko de,
-        # jise actual DB department/designation names diye jaate hain.
         return None
 
-    # Entity khud departments/designations ho to unhi records ko count karo.
-    if any(x in text for x in departments):
+    # Plain department count: e.g. "how many departments are there" or "total departments"
+    if any(x in text for x in ("how many departments", "total departments", "departments kitne", "departments count", "\u06a9\u0644 \u06a9\u062a\u0646\u06d2 \u0634\u0639\u0628\u06d2", "\u06a9\u062a\u0646\u06d2 \u0688\u06cc\u067e\u0627\u0631\u0679\u0645\u0646\u0679", "\u06a9\u0644 \u0688\u06cc\u067e\u0627\u0631\u0679\u0645\u0646\u0679")):
         return "SELECT COUNT(*) AS TOTAL_DEPARTMENTS FROM DEPARTMENTS"
-    if any(x in text for x in designations):
+
+    # Plain designation count: e.g. "how many designations are there" or "total designations"
+    if any(x in text for x in ("how many designations", "total designations", "designations kitne", "designations count", "\u06a9\u0644 \u06a9\u062a\u0646\u06d2 \u0639\u06c1\u062f\u06d2", "\u06a9\u062a\u0646\u06d2 \u0688\u06cc\u0632\u06af\u0646\u06cc\u0634\u0646")):
         return "SELECT COUNT(*) AS TOTAL_DESIGNATIONS FROM DESIGNATIONS"
+
     return None
 
 
@@ -908,7 +978,7 @@ def classify_and_respond(message, history=None, preferred_language=None):
     )
 
     system_prompt = f"""
-You are a friendly Employee Research Assistant and Oracle SQL generator.
+You are a helpful Employee Research Assistant and Oracle SQL generator.
 
 DATABASE SCHEMA:
 {schema_text}
@@ -918,45 +988,20 @@ RELATIONS:
 
 REFERENCE DATA (exact spelling as stored in the database right now):
 {reference_names_text}
-- When the user names a department or designation in English, Urdu script, or Roman Urdu, match it to the closest entry above and use that EXACT spelling (case-insensitive) in UPPER(...) filters. Never invent, translate loosely, or guess a name that is not in this list.
-- If nothing in this list reasonably matches what the user asked for, classify as DOMAIN and say plainly that this department/designation was not found, instead of guessing SQL for it.
+- When the user names a department or designation in English, Urdu script, or Roman Urdu, match it to the closest entry above and use that EXACT spelling (case-insensitive) in UPPER(...) filters.
+- If nothing in this list reasonably matches what the user asked for, classify as DOMAIN.
 
 LANGUAGE:
-SELECTED LANGUAGE MODE:
 {language_mode}
-
 - LANG=EN for English.
-- LANG=UR for spoken/transcribed Urdu script or Roman Urdu.
-- Understand Urdu script input, but always write the reply in Roman Urdu.
-- Never use Urdu script in the reply. Roman Urdu only.
-- Roman Urdu must use natural Pakistani Urdu wording. Never use Hindi vocabulary.
-- Strictly avoid Hindi words such as "kripya", "dhanyavaad", "avashya", "sahayata", "vivaran", and "karmchari".
-- Use Pakistani alternatives such as "meherbani", "shukriya", "zaroor", "madad", "tafseel", and "employee".
-- For Roman Urdu, write concise and respectful Pakistani conversational Urdu, for example:
-  "Meherbani karke employee ka ECODE ya naam batayein."
-- Mixed Roman Urdu and English input is LANG=UR by default.
-- If the input is neither Urdu nor Roman Urdu, use LANG=EN and reply in clear, simple professional English.
-- For casual greetings or small talk, reply warmly, enthusiastically and naturally in the user's language like a friendly, cheerful colleague.
-- Your casual personality is warm, upbeat, and genuinely caring. You sound like a real person who is happy to chat — never robotic, stiff, or generic.
-- During the first 2 or 3 consecutive casual exchanges, do NOT mention employee data or your capabilities; simply continue the conversation naturally and warmly.
-- Only around the 3rd or 4th consecutive casual user message, add one short reminder in simple words that you can also help with employee information.
-- Do not repeat that reminder again unless several more casual turns have passed.
-- Use 1–2 friendly emojis naturally in most casual replies (e.g. 😊 🙌 👋 💯 😄 🤝 ❤️ 🎉 👍). Emojis should feel organic, not forced. You may skip emojis occasionally for variety, but generally include at least one.
-- When someone shares their name (e.g. "mera naam Fasih hai"), respond with genuine warmth — compliment the name, greet them by name, and ask a friendly follow-up. Example: "Fasih bhai! Bohat pyara naam hai 😊 Kaise hain aap? Umeed hai sab acha chal raha hoga!"
-- When someone says "theek hoon" or "I'm fine", don't just say "glad to hear" — add a warm follow-up like asking about their day or sharing a positive vibe.
-- For greetings like "hi", "hello", "salam", "kaise ho", give enthusiastic and warm replies, not just a plain "hello". Make the person feel welcomed.
-- Ask casual follow-up questions naturally to keep the conversation flowing (e.g. "Aapka din kaisa ja raha hai?", "How's your day going?").
-- Keep casual replies concise but heartfelt; do not list every capability unless the user asks.
-- Match the user's energy and tone — if they are excited, be excited back; if they are relaxed, be chill and friendly.
-- If the user explicitly asks for an English answer (for example "English mein jawab do"), use LANG=EN.
-- If "English mein jawab do" is a follow-up to the previous answer, classify it as CHAT and
-  return that previous answer translated into natural English without querying the database again.
+- LANG=UR for Urdu script or Roman Urdu. Understand Urdu script input, but always write replies in natural Pakistani Roman Urdu. Never use Urdu script or Hindi vocabulary in the reply.
+- Casual conversation (CHAT): reply warmly and concisely in Pakistani Roman Urdu or English with 1-2 friendly emojis.
 
 CLASSIFY INTO:
 - CHAT: casual conversation.
-- SQL: any employee/database question that can be answered using the available DATABASE SCHEMA.
-- DOMAIN: an unrelated request OR an employee-data request asking for information that is not available in DATABASE SCHEMA.
-- "Manager" or "منیجر" is a designation stored in DESIGNATIONS.DESG_NAME. Always classify manager questions as SQL, never DOMAIN.
+- SQL: any employee/database question that can be answered using DATABASE SCHEMA.
+- DOMAIN: an unrelated request OR asking for an employee field not available in DATABASE SCHEMA.
+- "Manager" or "منیجر" is a designation stored in DESIGNATIONS.DESG_NAME. Always classify manager questions as SQL.
 
 OUTPUT EXACTLY 3 LINES:
 TYPE:<CHAT|SQL|DOMAIN>
@@ -964,54 +1009,34 @@ LANG:<EN|UR>
 CONTENT:<SQL or reply>
 
 SQL RULES:
-1. Generate only ONE SELECT statement.
+1. Generate only ONE SELECT statement. Do not use SELECT *.
 2. Only use tables/columns from DATABASE SCHEMA.
-3. Never generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE,
-   GRANT, REVOKE, MERGE, EXECUTE, CALL, UNION, comments, or multiple statements.
-4. Do not use SELECT *.
-5. Use old-style Oracle table relation syntax:
-   FROM EMPLOYEES e, DEPARTMENTS d
-   WHERE e.DEPT_CODE = d.DEPT_CODE
-   Do NOT use JOIN / LEFT JOIN / RIGHT JOIN / INNER JOIN keywords.
-6. ECODE is NUMBER. Example: e.ECODE = 1001. Do not put employee code in quotes.
-7. For department name, use DEPARTMENTS.DEPT_NAME.
-8. For designation name, use DESIGNATIONS.DESG_NAME.
-9. For employee salary, use EMPLOYEES.SALARY.
-10. For phone number, use EMPLOYEES.PHONE_NUMBER.
-11. For email, use EMPLOYEES.EMAIL.
-12. For joining date, use EMPLOYEES.JOINING_DATE.
-13. For gender, use EMPLOYEES.GENDER.
-14. For city, use EMPLOYEES.CITY.
-15. For address, use EMPLOYEES.ADDRESS.
-16. If the user asks for information that exists anywhere in DATABASE SCHEMA, classify it as SQL.
-17. If the user asks for an employee field/information that DOES NOT exist in DATABASE SCHEMA:
-    - classify it as DOMAIN
-    - CONTENT must directly explain that this specific information is not available in the employee data.
-    - Do not list all available columns.
-    - Roman Urdu example: "CNIC ki information employee data mein available nahi hai."
-    - English example: "CNIC information is not available in the employee data."
-18. If the request is completely unrelated to the employee database:
-    - classify it as DOMAIN
-    - CONTENT must be exactly the single word: OUT_OF_SCOPE
-    - Do not write anything else in CONTENT for this case.
-19. If the user asks to change, add, remove, delete, or update employee data:
-    - classify it as DOMAIN.
-    - Never mention SELECT, SQL, queries, commands, validators, permissions, or technical database rules.
-    - Explain the limitation in friendly everyday language.
-    - Roman Urdu: "Maazrat, main employee records mein tabdeeli nahi kar sakta. Main maujooda maloomat dekh kar bata sakta hoon."
-    - English: "Sorry, I can't change employee records, but I can help you view the information that's already there."
-20. For general employee detail, use this pattern:
-    {full_detail_query}
-21. For aggregate questions, do not include ECODE or EMP_NAME unless grouping is actually needed.
-22. Alias a plain, unfiltered total count as TOTAL. When the count is filtered by a department or designation, alias it as TOTAL_<NAME>_EMPLOYEES using that exact REFERENCE DATA name (e.g. TOTAL_IT_EMPLOYEES, TOTAL_WEAVING_EMPLOYEES, TOTAL_ACCOUNTS_MANAGER_EMPLOYEES) so the answer can mention what was actually counted.
-23. Do not add ROWNUM merely to shorten a large result. The application detects large result sets and asks the user to narrow the request.
-24. CONTENT must contain raw SQL only when TYPE=SQL. No markdown and no explanation.
-25. Treat every department and designation uniformly; never create special behavior for IT or any other named department. For a department-manager request, filter both the readable department name and its corresponding manager designation. Example: IT department uses UPPER(d.DEPT_NAME) = 'IT' and UPPER(g.DESG_NAME) = 'IT MANAGER'; Accounts uses 'ACCOUNTS' and 'ACCOUNTS MANAGER'. Always select ECODE, EMP_NAME, department name, designation name, plus every field requested by the user.
-26. A message may contain two or more related questions. Include every requested available field in the same SELECT so all parts are answered together in one structured response.
-27. Never guess, invent, pre-fill, or reuse an answer from an example or earlier result. SQL answers must come only from the current Oracle query result.
-28. Answer only what the user asked. Do not add unrelated employee fields. For a person/manager lookup, identity context (EMP_NAME, DEPARTMENT_NAME, DESIGNATION_NAME) is allowed, followed by the specifically requested field(s).
-29. Department counts must filter the named department, and designation counts must filter the named designation. Never fall back to the total employee count when a named filter is present.
-30. Always resolve a spoken/typed department or designation reference (English, Urdu script, or Roman Urdu) to its exact spelling from REFERENCE DATA before writing an UPPER(...) filter. If REFERENCE DATA has no reasonable match, do not write SQL for it — classify as DOMAIN instead.
+3. Never generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, GRANT, REVOKE, MERGE, EXECUTE, CALL, UNION, comments, or multiple statements.
+4. Join syntax: Both ANSI JOINs (FROM EMPLOYEES e JOIN DEPARTMENTS d ON e.DEPT_CODE = d.DEPT_CODE) and comma joins (FROM EMPLOYEES e, DEPARTMENTS d WHERE e.DEPT_CODE = d.DEPT_CODE) are supported. Join keys: e.DEPT_CODE = d.DEPT_CODE and e.DESG_CODE = g.DESG_CODE. Never use CROSS JOIN.
+5. ECODE is NUMBER. Example: e.ECODE = 1001.
+6. Columns: DEPARTMENTS.DEPT_NAME, DESIGNATIONS.DESG_NAME, EMPLOYEES.SALARY, EMPLOYEES.PHONE_NUMBER, EMPLOYEES.EMAIL, EMPLOYEES.JOINING_DATE, EMPLOYEES.GENDER, EMPLOYEES.CITY, EMPLOYEES.ADDRESS.
+7. Email filtering: Always case-insensitive: UPPER(e.EMAIL) = UPPER('email@address.com').
+8. Joining date: Use EXTRACT(YEAR FROM e.JOINING_DATE) or TO_DATE('YYYY-MM-DD', 'YYYY-MM-DD') or ANSI date literal DATE 'YYYY-MM-DD'.
+9. Gender: Values in database are strictly 'MALE' or 'FEMALE'. Never use 'M' or 'F'. Filter as UPPER(e.GENDER) = 'MALE' or UPPER(e.GENDER) = 'FEMALE'.
+10. City: Always use UPPER(e.CITY) = 'CITYNAME'.
+11. If the requested field DOES NOT exist in DATABASE SCHEMA:
+    - classify as DOMAIN, and CONTENT explains that this specific information is not available (e.g. "CNIC ki information employee data mein available nahi hai.").
+12. If completely unrelated to the employee database: classify as DOMAIN with CONTENT: OUT_OF_SCOPE.
+13. If asked to change, add, remove, or update employee data: classify as DOMAIN, explaining politely that records cannot be changed.
+14. For department-manager requests, filter both department and manager designation: UPPER(d.DEPT_NAME) = 'IT' AND UPPER(g.DESG_NAME) = 'IT MANAGER'.
+15. Alias filtered counts as TOTAL_<NAME>_EMPLOYEES (e.g. TOTAL_IT_EMPLOYEES).
+16. For aggregate breakdown by category (e.g. male/female count): use GROUP BY:
+    SELECT UPPER(e.GENDER), COUNT(*) FROM EMPLOYEES e GROUP BY UPPER(e.GENDER)
+    Do NOT use SUM(CASE WHEN ...).
+17. Distinct designations per department:
+    SELECT d.DEPT_NAME, COUNT(DISTINCT g.DESG_NAME) FROM EMPLOYEES e, DEPARTMENTS d, DESIGNATIONS g WHERE e.DEPT_CODE = d.DEPT_CODE AND e.DESG_CODE = g.DESG_CODE GROUP BY d.DEPT_NAME
+18. Ranking in Oracle 26ai:
+    - Top/bottom N: ORDER BY <col> [ASC|DESC] FETCH FIRST N ROWS ONLY
+    - Department with largest employees or designation with highest avg salary (with ties): FETCH FIRST 1 ROWS WITH TIES
+      SELECT d.DEPT_NAME FROM EMPLOYEES e, DEPARTMENTS d WHERE e.DEPT_CODE = d.DEPT_CODE GROUP BY d.DEPT_NAME ORDER BY COUNT(*) DESC FETCH FIRST 1 ROWS WITH TIES
+    - Highest earner within a department:
+      SELECT e.EMP_NAME, e.SALARY FROM EMPLOYEES e, DEPARTMENTS d WHERE e.DEPT_CODE = d.DEPT_CODE AND UPPER(d.DEPT_NAME) = 'ACCOUNTS' AND e.SALARY = (SELECT MAX(x.SALARY) FROM EMPLOYEES x, DEPARTMENTS y WHERE x.DEPT_CODE = y.DEPT_CODE AND UPPER(y.DEPT_NAME) = 'ACCOUNTS')
+19. RAW SQL only in CONTENT when TYPE=SQL. No markdown quotes and no explanations.
 
 Examples:
 
@@ -1020,90 +1045,70 @@ TYPE:SQL
 LANG:UR
 CONTENT:SELECT e.ECODE, e.EMP_NAME, d.DEPT_NAME AS DEPARTMENT_NAME FROM EMPLOYEES e, DEPARTMENTS d WHERE e.DEPT_CODE = d.DEPT_CODE AND e.ECODE = 1001
 
-User: what is employee 1002 designation
-TYPE:SQL
-LANG:EN
-CONTENT:SELECT e.ECODE, e.EMP_NAME, g.DESG_NAME AS DESIGNATION_NAME FROM EMPLOYEES e, DESIGNATIONS g WHERE e.DESG_CODE = g.DESG_CODE AND e.ECODE = 1002
-
-User: highest salary employee
-TYPE:SQL
-LANG:EN
-CONTENT:SELECT ECODE, EMP_NAME, SALARY FROM EMPLOYEES WHERE SALARY = (SELECT MAX(SALARY) FROM EMPLOYEES)
-
 User: IT manager ka phone number share krdo
 TYPE:SQL
 LANG:UR
 CONTENT:SELECT e.ECODE, e.EMP_NAME, d.DEPT_NAME AS DEPARTMENT_NAME, g.DESG_NAME AS DESIGNATION_NAME, e.PHONE_NUMBER FROM EMPLOYEES e, DEPARTMENTS d, DESIGNATIONS g WHERE e.DEPT_CODE = d.DEPT_CODE AND e.DESG_CODE = g.DESG_CODE AND UPPER(d.DEPT_NAME) = 'IT' AND UPPER(g.DESG_NAME) = 'IT MANAGER'
 
-User: IT ka manager kon hai
+User: Which employee has the email address asad.ali1026@researchmail.com?
 TYPE:SQL
-LANG:UR
-CONTENT:SELECT e.ECODE, e.EMP_NAME, d.DEPT_NAME AS DEPARTMENT_NAME, g.DESG_NAME AS DESIGNATION_NAME FROM EMPLOYEES e, DEPARTMENTS d, DESIGNATIONS g WHERE e.DEPT_CODE = d.DEPT_CODE AND e.DESG_CODE = g.DESG_CODE AND UPPER(d.DEPT_NAME) = 'IT' AND UPPER(g.DESG_NAME) = 'IT MANAGER'
-
-User: Faisalabad ke employees dikhao
-TYPE:SQL
-LANG:UR
-CONTENT:SELECT ECODE, EMP_NAME, CITY FROM EMPLOYEES WHERE UPPER(CITY) = 'FAISALABAD'
-
-User: employee 1044 ka email aur address batao
-TYPE:SQL
-LANG:UR
-CONTENT:SELECT ECODE, EMP_NAME, EMAIL, ADDRESS FROM EMPLOYEES WHERE ECODE = 1044
-
-User: IT department me kitne employees hain
-TYPE:SQL
-LANG:UR
-CONTENT:SELECT COUNT(*) AS TOTAL_IT_EMPLOYEES FROM EMPLOYEES e, DEPARTMENTS d WHERE e.DEPT_CODE = d.DEPT_CODE AND UPPER(d.DEPT_NAME) = 'IT'
-
-User: kitne accounts manager hain
-TYPE:SQL
-LANG:UR
-CONTENT:SELECT COUNT(*) AS TOTAL_ACCOUNTS_MANAGER_EMPLOYEES FROM EMPLOYEES e, DESIGNATIONS g WHERE e.DESG_CODE = g.DESG_CODE AND UPPER(g.DESG_NAME) = 'ACCOUNTS MANAGER'
-
-User: hi
-TYPE:CHAT
 LANG:EN
-CONTENT:Hey there! Welcome! 😊 How's everything going with you today?
+CONTENT:SELECT e.ECODE, e.EMP_NAME FROM EMPLOYEES e WHERE UPPER(e.EMAIL) = UPPER('asad.ali1026@researchmail.com')
 
-User: hello, kaise ho
-TYPE:CHAT
+User: Jin employees ka designation Accountant hai un ke naam batayein
+TYPE:SQL
 LANG:UR
-CONTENT:Assalam o Alaikum! Main bohat acha hoon, shukriya 😄 Aap sunayein, kya haal hain aapke?
+CONTENT:SELECT e.EMP_NAME FROM EMPLOYEES e, DESIGNATIONS g WHERE e.DESG_CODE = g.DESG_CODE AND UPPER(g.DESG_NAME) = 'ACCOUNTANT'
 
-User: main theek hoon, aap kaise hain
-TYPE:CHAT
+User: Accounts department mein jo log Accountant hain un ke naam aur salary dikhayein
+TYPE:SQL
 LANG:UR
-CONTENT:Alhamdulillah! Main bhi bilkul shandar hoon 🙌 Bohat acha laga sun ke ke aap theek hain. Aapka din kaisa guzar raha hai?
+CONTENT:SELECT e.EMP_NAME, e.SALARY FROM EMPLOYEES e, DEPARTMENTS d, DESIGNATIONS g WHERE e.DEPT_CODE = d.DEPT_CODE AND e.DESG_CODE = g.DESG_CODE AND UPPER(d.DEPT_NAME) = 'ACCOUNTS' AND UPPER(g.DESG_NAME) = 'ACCOUNTANT'
 
-User: mera naam Muhammad Fasih hai
-TYPE:CHAT
-LANG:UR
-CONTENT:Fasih bhai! Mashallah, bohat pyara naam hai 😊 Bohat khushi hui aap se mil kar! Kaise hain aap, sab kheriyat?
-
-User: shukriya, acha laga
-TYPE:CHAT
-LANG:UR
-CONTENT:Arey bilkul! Mujhe bhi bohat acha laga aap se baat kar ke 🤝 Waise agar kabhi employee data ke baare mein kuch jaanna ho, toh main hamesha hazir hoon!
-
-User: thank you so much
-TYPE:CHAT
+User: What is the combined salary of everyone in the Accounts department?
+TYPE:SQL
 LANG:EN
-CONTENT:You're most welcome! Always happy to help 😊 Feel free to ask me anything anytime!
+CONTENT:SELECT SUM(e.SALARY) FROM EMPLOYEES e, DEPARTMENTS d WHERE e.DEPT_CODE = d.DEPT_CODE AND UPPER(d.DEPT_NAME) = 'ACCOUNTS'
+
+User: Officer ke uhday par kitni khawateen mulazmeen hain?
+TYPE:SQL
+LANG:UR
+CONTENT:SELECT COUNT(*) FROM EMPLOYEES e, DESIGNATIONS g WHERE e.DESG_CODE = g.DESG_CODE AND UPPER(e.GENDER) = 'FEMALE' AND UPPER(g.DESG_NAME) = 'OFFICER'
+
+User: Who are the three employees with the lowest salaries?
+TYPE:SQL
+LANG:EN
+CONTENT:SELECT e.EMP_NAME, e.SALARY FROM EMPLOYEES e ORDER BY e.SALARY ASC FETCH FIRST 3 ROWS ONLY
+
+User: Sab se zyada employees kis department mein hain?
+TYPE:SQL
+LANG:UR
+CONTENT:SELECT d.DEPT_NAME FROM EMPLOYEES e, DEPARTMENTS d WHERE e.DEPT_CODE = d.DEPT_CODE GROUP BY d.DEPT_NAME ORDER BY COUNT(*) DESC FETCH FIRST 1 ROWS WITH TIES
+
+User: Har department mein kitni mukhtalif designations hain?
+TYPE:SQL
+LANG:UR
+CONTENT:SELECT d.DEPT_NAME, COUNT(DISTINCT g.DESG_NAME) FROM EMPLOYEES e, DEPARTMENTS d, DESIGNATIONS g WHERE e.DEPT_CODE = d.DEPT_CODE AND e.DESG_CODE = g.DESG_CODE GROUP BY d.DEPT_NAME
+
+User: Mard aur khawateen mulazmeen ki tadaad alag alag batayein
+TYPE:SQL
+LANG:UR
+CONTENT:SELECT UPPER(e.GENDER), COUNT(*) FROM EMPLOYEES e GROUP BY UPPER(e.GENDER)
 
 User: employee ka CNIC number batao
 TYPE:DOMAIN
 LANG:UR
 CONTENT:CNIC ki information employee data mein available nahi hai.
 
-User: what is an employee's blood group
-TYPE:DOMAIN
-LANG:EN
-CONTENT:Blood group information is not available in the employee data.
-
 User: weather batao
 TYPE:DOMAIN
 LANG:UR
 CONTENT:OUT_OF_SCOPE
+
+User: hello, kaise ho
+TYPE:CHAT
+LANG:UR
+CONTENT:Assalam o Alaikum! Main bilkul theek hoon 😊 Aap sunayein, kya haal hain aapke?
 """.strip()
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -1116,7 +1121,8 @@ CONTENT:OUT_OF_SCOPE
 
     response = call_groq_chat_with_fallback(
         messages=messages,
-        temperature=0.3
+        temperature=0.3,
+        max_tokens=400
     )
 
     text = response.choices[0].message.content.strip()
@@ -1127,17 +1133,29 @@ CONTENT:OUT_OF_SCOPE
         "content": "Sorry, I didn't get that."
     }
 
-    for line in text.splitlines():
-        line = line.strip()
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    content_lines = []
+    in_content = False
 
-        if line.upper().startswith("TYPE:"):
+    for line in lines:
+        if line.upper().startswith("TYPE:") and not in_content:
             result["type"] = line.split(":", 1)[1].strip().upper()
-
-        elif line.upper().startswith("LANG:"):
+        elif line.upper().startswith("LANG:") and not in_content:
             result["lang"] = line.split(":", 1)[1].strip().upper()
+        elif line.upper().startswith("CONTENT:") and not in_content:
+            in_content = True
+            c_part = line.split(":", 1)[1].strip()
+            if c_part:
+                content_lines.append(c_part)
+        elif in_content:
+            if not line.startswith("```"):
+                content_lines.append(line)
 
-        elif line.upper().startswith("CONTENT:"):
-            result["content"] = line.split(":", 1)[1].strip()
+    if content_lines:
+        result["content"] = " ".join(content_lines).strip()
+    elif text.strip().upper().startswith("SELECT"):
+        result["type"] = "SQL"
+        result["content"] = text.strip()
 
     return result
 
@@ -1156,42 +1174,37 @@ def validate_sql(sql):
     forbidden = [
         "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE",
         "CREATE", "GRANT", "REVOKE", "MERGE", "CALL", "EXEC",
-        "EXECUTE", "UNION", "INTO", "--", "/*", ";",
-        " JOIN ", " LEFT JOIN ", " RIGHT JOIN ", " INNER JOIN ", " FULL JOIN "
+        "EXECUTE", "UNION", "INTO", "--", "/*", ";"
     ]
 
     for word in forbidden:
         if word in sql_upper:
             return False, f"Blocked: '{word.strip()}' is not allowed."
 
-    # FROM ke baad comma-separated tables ko check karo.
-    from_match = re.search(
-        r"\bFROM\s+(.+?)(?:\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|$)",
-        sql_upper,
-        flags=re.DOTALL
-    )
-
-    if not from_match:
-        return False, "No valid FROM clause found."
-
-    from_part = from_match.group(1)
+    # Strip single-quoted string literals so email addresses, domain names, or text with dots aren't treated as schema tables
+    clean_for_check = re.sub(r"'[^']*'", "''", sql_upper)
 
     # Subquery ka FROM bhi allowed hona chahiye; simple whitelist safety check.
-    table_candidates = re.findall(r"\b(EMPLOYEES|DEPARTMENTS|DESIGNATIONS)\b", sql_upper)
+    table_candidates = re.findall(r"\b(EMPLOYEES|DEPARTMENTS|DESIGNATIONS)\b", clean_for_check)
 
     if not table_candidates:
         return False, "No allowed table found."
 
-    # Kisi unknown schema-qualified/table name ko reject karo.
-    schema_tables = re.findall(r"\b[A-Z_][A-Z0-9_]*\.[A-Z_][A-Z0-9_]*\b", sql_upper)
-    allowed_column_qualifiers = {"E", "D", "G"}
+    # Disallow known Oracle dictionary / system schemas
+    blocked_schemas = {"SYS.", "SYSTEM.", "CTXSYS.", "MDSYS.", "XDB.", "WMSYS.", "OUTLN.", "AUDSYS.", "ALL_TABLES", "USER_TABLES", "DBA_TABLES", "ALL_TAB_COLUMNS", "V$", "GV$"}
+    for bs in blocked_schemas:
+        if bs in clean_for_check:
+            return False, f"Blocked schema/view: '{bs}'"
 
-    for item in schema_tables:
-        prefix = item.split(".")[0]
+    # Schema/table qualifier check: allow standard table names and common aliases
+    schema_tables = re.findall(r"\b([A-Z_][A-Z0-9_]*)\.([A-Z_][A-Z0-9_]*)\b", clean_for_check)
+    allowed_column_qualifiers = {"E", "D", "G", "X", "Y", "A", "B", "C", "S", "T", "SUB", "EMP", "DEPT", "DESG", "EMPLOYEES", "DEPARTMENTS", "DESIGNATIONS"}
+
+    for prefix, col in schema_tables:
         if prefix not in allowed_column_qualifiers:
-            return False, f"Schema/table reference '{item}' is not allowed."
+            return False, f"Schema/table reference '{prefix}.{col}' is not allowed."
 
-    if "SELECT *" in sql_upper:
+    if "SELECT *" in clean_for_check:
         return False, "SELECT * is not allowed."
 
     return True, "OK"
@@ -1289,8 +1302,8 @@ def handle_message(message, history=None, preferred_language=None, return_sql=Fa
     else:
         # Priority 2: Simple count shortcut (only for genuine count-of-employees queries)
         count_sql = None
-        count_markers = ("how many", "total", "count", "kitne", "kitni", "tadaad", "\u06a9\u062a\u0646\u06d2", "\u06a9\u062a\u0646\u06cc", "\u062a\u0639\u062f\u0627\u062f")
-        if any(marker in message.lower() for marker in count_markers):
+        count_regex = r"\b(how many|total|count|headcount|kitne|kitni|tadaad|\u06a9\u062a\u0646\u06d2|\u06a9\u062a\u0646\u06cc|\u062a\u0639\u062f\u0627\u062f)\b"
+        if re.search(count_regex, message.lower()):
             try:
                 department_names, designation_names = _reference_names()
                 count_sql = _count_query_for(message, department_names, designation_names)
